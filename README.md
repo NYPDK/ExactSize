@@ -2,11 +2,13 @@
 
 A local Linux video compressor with one promise: the output is **never larger than the size you set**. Pick a video, a maximum size, and a codec. ExactSize works out the bitrate, encodes, measures the real file, and only saves it once it fits.
 
+![ExactSize showing a completed AV1 compression](docs/images/exactsize-preview.png)
+
 ## Run it
 
 ```bash
-chmod +x ExactSize-1.8.20-x86_64.AppImage
-./ExactSize-1.8.20-x86_64.AppImage
+chmod +x ExactSize-1.8.21-x86_64.AppImage
+./ExactSize-1.8.21-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
