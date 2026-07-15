@@ -201,6 +201,15 @@ html.frameless .app-header {
   letter-spacing: -.015em;
 }
 
+.brand-version {
+  margin-left: -2px;
+  color: var(--faint);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+  letter-spacing: .02em;
+}
+
 .runtime-status {
   display: flex;
   align-items: center;
@@ -593,6 +602,84 @@ select {
 
 .field-row select {
   width: 100%;
+}
+
+.frame-rate-control {
+  display: grid;
+  grid-template-columns: minmax(64px, 1fr) minmax(94px, auto);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.frame-rate-control input[type="range"] {
+  width: 100%;
+  height: 18px;
+  padding: 0;
+  appearance: none;
+  color: var(--accent);
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  cursor: pointer;
+}
+
+.frame-rate-control input[type="range"]:hover,
+.frame-rate-control input[type="range"]:focus {
+  background: transparent;
+  border: 0;
+}
+
+.frame-rate-control input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  background: linear-gradient(to right, var(--accent) 0 var(--range-progress, 100%), var(--toggle-track) var(--range-progress, 100%) 100%);
+  border-radius: 999px;
+}
+
+.frame-rate-control input[type="range"]::-webkit-slider-thumb {
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  appearance: none;
+  background: var(--accent);
+  border: 2px solid var(--settings-bg);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.frame-rate-control input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: var(--toggle-track);
+  border-radius: 999px;
+}
+
+.frame-rate-control input[type="range"]::-moz-range-progress {
+  height: 4px;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.frame-rate-control input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border: 2px solid var(--settings-bg);
+  border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.frame-rate-control output {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-rate-row.unavailable {
+  opacity: .52;
 }
 
 .toggle-row {

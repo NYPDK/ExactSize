@@ -20,11 +20,19 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
 
-const version = "1.8.7"
+const version = "1.8.12"
+
+const (
+	minimumWindowWidth   = 1040
+	minimumWindowHeight  = 660
+	browserProfilePrefix = "exactsize-browser-"
+	browserProfileOwner  = ".exactsize-owner-pid"
+)
 
 //go:embed web/*
 var webAssets embed.FS
@@ -89,11 +97,12 @@ func run() error {
 		fmt.Println(url)
 	} else {
 		hideTitleBarOnKDE()
-		browser, waitForWindow, err := launchAppWindow(url)
+		browser, waitForWindow, cleanupBrowser, err := launchAppWindow(url)
 		if err != nil {
 			_ = listener.Close()
 			return fmt.Errorf("open application window: %w", err)
 		}
+		defer cleanupBrowser()
 		if waitForWindow {
 			go func() {
 				_ = browser.Wait()
@@ -152,46 +161,108 @@ func randomToken() string {
 	return hex.EncodeToString(data)
 }
 
-func launchAppWindow(url string) (*exec.Cmd, bool, error) {
+func processIsRunning(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	err = process.Signal(syscall.Signal(0))
+	return err == nil || errors.Is(err, os.ErrPermission)
+}
+
+func cleanupStaleBrowserProfiles() {
+	profiles, _ := filepath.Glob(filepath.Join(os.TempDir(), browserProfilePrefix+"*"))
+	for _, profileDir := range profiles {
+		owner, err := os.ReadFile(filepath.Join(profileDir, browserProfileOwner))
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(owner)))
+			if parseErr == nil && processIsRunning(pid) {
+				continue
+			}
+			_ = os.RemoveAll(profileDir)
+			continue
+		}
+
+		// Profiles from older releases have no owner marker. Leave recent ones
+		// alone in case an older ExactSize instance is still using one, but
+		// remove abandoned legacy profiles on a later launch.
+		if info, statErr := os.Stat(profileDir); statErr == nil && time.Since(info.ModTime()) > 24*time.Hour {
+			_ = os.RemoveAll(profileDir)
+		}
+	}
+}
+
+func createBrowserProfile() (string, func(), error) {
+	cleanupStaleBrowserProfiles()
+	profileDir, err := os.MkdirTemp("", browserProfilePrefix)
+	if err != nil {
+		return "", func() {}, err
+	}
+	if err := os.WriteFile(
+		filepath.Join(profileDir, browserProfileOwner),
+		[]byte(strconv.Itoa(os.Getpid())),
+		0o600,
+	); err != nil {
+		_ = os.RemoveAll(profileDir)
+		return "", func() {}, err
+	}
+
+	var once sync.Once
+	cleanup := func() {
+		once.Do(func() { _ = os.RemoveAll(profileDir) })
+	}
+	return profileDir, cleanup, nil
+}
+
+func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
 	type candidate struct {
 		command string
 		args    []string
 		wait    bool
+		profile bool
 	}
 
-	profileDir, _ := os.MkdirTemp("", "exactsize-browser-")
-	if profileDir != "" {
-		// Pre-acknowledge Brave's analytics notice and disable its reporting;
-		// a fresh profile would otherwise show the banner on every launch.
-		// Chrome and Chromium ignore these keys.
-		seed := []byte(`{"brave":{"p3a":{"enabled":false,"notice_acknowledged":true},"stats_reporting":{"enabled":false}}}`)
-		_ = os.WriteFile(filepath.Join(profileDir, "Local State"), seed, 0o600)
+	profileDir, cleanupProfile, err := createBrowserProfile()
+	if err != nil {
+		return nil, false, func() {}, fmt.Errorf("create temporary browser profile: %w", err)
 	}
+	// Pre-acknowledge Brave's analytics notice and disable its reporting; a
+	// fresh profile would otherwise show the banner on every launch. Chrome
+	// and Chromium ignore these keys.
+	seed := []byte(`{"brave":{"p3a":{"enabled":false,"notice_acknowledged":true},"stats_reporting":{"enabled":false}}}`)
+	_ = os.WriteFile(filepath.Join(profileDir, "Local State"), seed, 0o600)
 	chromeArgs := []string{
 		"--app=" + url,
 		"--new-window",
 		"--no-first-run",
 		"--disable-session-crashed-bubble",
 		"--class=ExactSize",
-		"--window-size=1040,620",
+		fmt.Sprintf("--window-size=%d,%d", minimumWindowWidth, minimumWindowHeight),
 		// XWayland instead of native Wayland: X11 windows can start a real
 		// compositor move/resize (_NET_WM_MOVERESIZE), which native Wayland
 		// offers no external API for, and --class works as the window class.
 		"--ozone-platform=x11",
-	}
-	if profileDir != "" {
-		chromeArgs = append(chromeArgs, "--user-data-dir="+profileDir)
+		"--disable-background-networking",
+		"--disable-component-update",
+		"--disable-default-apps",
+		"--disable-sync",
+		"--disk-cache-size=1048576",
+		"--media-cache-size=1048576",
+		"--user-data-dir=" + profileDir,
 	}
 
 	var candidates []candidate
 	if preferred := strings.TrimSpace(os.Getenv("EXACTSIZE_BROWSER")); preferred != "" {
-		candidates = append(candidates, candidate{preferred, chromeArgs, true})
+		candidates = append(candidates, candidate{preferred, chromeArgs, true, true})
 	}
 	for _, browser := range []string{
 		"brave-browser", "brave", "google-chrome-stable", "google-chrome",
 		"chromium", "chromium-browser", "microsoft-edge-stable", "microsoft-edge",
 	} {
-		candidates = append(candidates, candidate{browser, chromeArgs, true})
+		candidates = append(candidates, candidate{browser, chromeArgs, true, true})
 	}
 	if _, err := exec.LookPath("flatpak"); err == nil {
 		for _, appID := range []string{
@@ -201,12 +272,12 @@ func launchAppWindow(url string) (*exec.Cmd, bool, error) {
 				continue
 			}
 			args := append([]string{"run", appID}, chromeArgs...)
-			candidates = append(candidates, candidate{"flatpak", args, true})
+			candidates = append(candidates, candidate{"flatpak", args, true, true})
 		}
 	}
 	candidates = append(candidates,
-		candidate{"firefox", []string{"--new-window", url}, false},
-		candidate{"xdg-open", []string{url}, false},
+		candidate{"firefox", []string{"--new-window", url}, false, false},
+		candidate{"xdg-open", []string{url}, false, false},
 	)
 
 	for _, item := range candidates {
@@ -218,11 +289,15 @@ func launchAppWindow(url string) (*exec.Cmd, bool, error) {
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
 		if err := cmd.Start(); err == nil {
-			return cmd, item.wait, nil
+			if !item.profile {
+				cleanupProfile()
+			}
+			return cmd, item.wait, cleanupProfile, nil
 		}
 	}
 
-	return nil, false, errors.New("no supported browser was found (Brave, Chrome, Chromium, Firefox, or xdg-open)")
+	cleanupProfile()
+	return nil, false, func() {}, errors.New("no supported browser was found (Brave, Chrome, Chromium, Firefox, or xdg-open)")
 }
 
 // integrateAppImage installs a launcher entry and icons under ~/.local/share
@@ -356,12 +431,12 @@ func hideTitleBarOnKDE() {
 	if !hasMinSize {
 		kept = append(kept, "exactsize-minsize")
 	}
-	// The layout needs 1040x620; below that, scrollbars appear. A forced
+	// The layout needs the configured minimum; below it, scrollbars appear. A forced
 	// KWin minimum covers every resize path, including window edges. Written
 	// unconditionally so pattern updates reach existing installs.
 	minSizeSettings := [][2]string{
 		{"Description", "ExactSize app window: minimum size"},
-		{"minsize", "1040,620"},
+		{"minsize", fmt.Sprintf("%d,%d", minimumWindowWidth, minimumWindowHeight)},
 		{"minsizerule", "2"},
 		{"title", "ExactSize"},
 		{"titlematch", "1"},
@@ -369,11 +444,12 @@ func hideTitleBarOnKDE() {
 		{"wmclassmatch", "3"}, // regex
 		{"types", "1"},
 	}
-	if read("kwinrulesrc", "exactsize-minsize", "wmclass") != exactSizeClassPattern {
-		for _, setting := range minSizeSettings {
-			if err := write("kwinrulesrc", "exactsize-minsize", setting[0], setting[1]); err != nil {
-				return
-			}
+	for _, setting := range minSizeSettings {
+		if read("kwinrulesrc", "exactsize-minsize", setting[0]) == setting[1] {
+			continue
+		}
+		if err := write("kwinrulesrc", "exactsize-minsize", setting[0], setting[1]); err != nil {
+			return
 		}
 		changed = true
 	}

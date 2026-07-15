@@ -20,6 +20,7 @@ import (
 const (
 	minimumVideoBitrateKbps = 64
 	maximumEncodeAttempts   = 8
+	minimumOutputFPS        = 5
 )
 
 var minimumAudioBitrateKbps = map[string]int{
@@ -39,23 +40,24 @@ type EncoderInfo struct {
 }
 
 type EncodeRequest struct {
-	Input            string `json:"input"`
-	Output           string `json:"output"`
-	TargetBytes      int64  `json:"targetBytes"`
-	Container        string `json:"container"`
-	VideoCodec       string `json:"videoCodec"`
-	Encoder          string `json:"encoder"`
-	Preset           string `json:"preset"`
-	AudioCodec       string `json:"audioCodec"`
-	AudioBitrateKbps int    `json:"audioBitrateKbps"`
-	AudioChannels    string `json:"audioChannels"`
-	TwoPass          bool   `json:"twoPass"`
-	ResolutionHeight int    `json:"resolutionHeight"`
-	Remux            bool   `json:"remux"`
-	MuxAudio         bool   `json:"muxAudio"`
-	VAAPIDevice      string `json:"-"`
-	ScaleWidth       int    `json:"-"`
-	ScaleHeight      int    `json:"-"`
+	Input            string  `json:"input"`
+	Output           string  `json:"output"`
+	TargetBytes      int64   `json:"targetBytes"`
+	Container        string  `json:"container"`
+	VideoCodec       string  `json:"videoCodec"`
+	Encoder          string  `json:"encoder"`
+	Preset           string  `json:"preset"`
+	AudioCodec       string  `json:"audioCodec"`
+	AudioBitrateKbps int     `json:"audioBitrateKbps"`
+	AudioChannels    string  `json:"audioChannels"`
+	TwoPass          bool    `json:"twoPass"`
+	ResolutionHeight int     `json:"resolutionHeight"`
+	OutputFPS        float64 `json:"outputFps"`
+	Remux            bool    `json:"remux"`
+	MuxAudio         bool    `json:"muxAudio"`
+	VAAPIDevice      string  `json:"-"`
+	ScaleWidth       int     `json:"-"`
+	ScaleHeight      int     `json:"-"`
 }
 
 // mapProbeCodec normalizes an ffprobe codec name onto the app's codec keys;
@@ -201,6 +203,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	if useTwoPass {
 		passes = 2
 	}
+	progressFPS := effectiveOutputFPS(j.request, info)
 
 	videoKbps, err := calculateVideoBitrate(j.request, info)
 	if err != nil {
@@ -231,6 +234,10 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	})
 
 	originalKbps := videoKbps
+	previousRequestedKbps := 0
+	previousActualKbps := 0
+	previousScaleWidth := -1
+	previousScaleHeight := -1
 
 	for attempt := 1; attempt <= maximumEncodeAttempts; attempt++ {
 		if err := j.ctx.Err(); err != nil {
@@ -253,16 +260,16 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 
 		if useTwoPass {
 			firstPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, true)
-			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, info.FPS, 1, 2, attempt, tempOutput); err != nil {
+			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, progressFPS, 1, 2, attempt, tempOutput); err != nil {
 				return err
 			}
 			secondPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 2, true)
-			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, info.FPS, 2, 2, attempt, tempOutput); err != nil {
+			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput); err != nil {
 				return err
 			}
 		} else {
 			args := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, false)
-			if err := j.runFFmpeg(ffmpeg, args, info.Duration, info.FPS, 1, 1, attempt, tempOutput); err != nil {
+			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput); err != nil {
 				return err
 			}
 		}
@@ -327,17 +334,32 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			// top of the request. Subtracting the measured excess converges
 			// in one correction where a ratio cut needs several. When the
 			// excess eats most of the budget, exhaust the minimum bitrate
-			// before allowing Auto resolution to step down.
+			// before allowing Auto resolution to step down, unless a prior
+			// same-resolution correction already confirmed the floor.
 			correctionBudgetKbps := originalKbps
 			if availableVideoKbps > 0 {
 				correctionBudgetKbps = hardwareSafeBitrate(availableVideoKbps)
 			}
+			confirmedFloor := previousScaleWidth == j.request.ScaleWidth &&
+				previousScaleHeight == j.request.ScaleHeight &&
+				correctionHitBitrateFloor(previousRequestedKbps, previousActualKbps, videoKbps, actualVideoKbps, correctionBudgetKbps)
+			previousRequestedKbps = videoKbps
+			previousActualKbps = actualVideoKbps
+			previousScaleWidth = j.request.ScaleWidth
+			previousScaleHeight = j.request.ScaleHeight
+
 			retryKbps, hopeless := hardwareCorrection(correctionBudgetKbps, videoKbps, actualVideoKbps)
 			if likelyAV1VAAPIBitrateFloor(j.request, info, videoKbps, actualVideoKbps, correctionBudgetKbps) {
 				hopeless = true
 			}
+			if confirmedFloor {
+				hopeless = true
+			}
 			if hopeless {
-				if minimumKbps, ok := minimumBitrateRetry(videoKbps); ok {
+				// A same-resolution retry is direct evidence that lower requests no
+				// longer reduce the delivered stream. Skip another minimum-bitrate
+				// attempt in that case; it would only waste a full encode pass.
+				if minimumKbps, ok := minimumBitrateRetry(videoKbps); ok && !confirmedFloor {
 					videoKbps = minimumKbps
 					j.set(func(status *JobSnapshot) {
 						status.Message = "Trying the minimum video bitrate before reducing resolution…"
@@ -354,7 +376,11 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 				j.request.ScaleWidth, j.request.ScaleHeight = width, height
 				videoKbps = correctionBudgetKbps
 				j.set(func(status *JobSnapshot) {
-					status.Message = fmt.Sprintf("The GPU encoder hit its minimum bitrate; retrying at %d×%d…", width, height)
+					if confirmedFloor {
+						status.Message = fmt.Sprintf("Lowering the GPU bitrate stopped reducing the output; retrying at %d×%d…", width, height)
+					} else {
+						status.Message = fmt.Sprintf("The GPU encoder hit its minimum bitrate; retrying at %d×%d…", width, height)
+					}
 				})
 				continue
 			}
@@ -718,40 +744,68 @@ func videoEncoderArgs(request EncodeRequest, info VideoInfo, bitrateKbps int) []
 		if tenBitSource && request.VideoCodec != "h264" {
 			surface = "p010"
 		}
-		filter := "format=" + surface + ",hwupload"
-		if request.ScaleHeight > 0 {
-			filter += fmt.Sprintf(",scale_vaapi=%d:%d", request.ScaleWidth, request.ScaleHeight)
+		filters := make([]string, 0, 4)
+		if filter := frameRateFilter(request, info); filter != "" {
+			filters = append(filters, filter)
 		}
-		args = append(args, "-vf", filter)
+		filters = append(filters, "format="+surface, "hwupload")
+		if request.ScaleHeight > 0 {
+			filters = append(filters, fmt.Sprintf("scale_vaapi=%d:%d", request.ScaleWidth, request.ScaleHeight))
+		}
+		args = append(args, "-vf", strings.Join(filters, ","))
 	case request.Encoder == "libvvenc":
 		// vvenc encodes Main 10 only.
-		args = appendScale(args, request)
+		args = appendVideoFilters(args, request, info)
 		args = append(args, "-pix_fmt", "yuv420p10le")
 	case strings.HasSuffix(request.Encoder, "_nvenc"), strings.HasSuffix(request.Encoder, "_qsv"), strings.HasSuffix(request.Encoder, "_amf"):
-		args = appendScale(args, request)
+		args = appendVideoFilters(args, request, info)
 		if tenBitSource && request.VideoCodec != "h264" {
 			args = append(args, "-pix_fmt", "p010le")
 		} else {
 			args = append(args, "-pix_fmt", "nv12")
 		}
 	case request.VideoCodec == "h264":
-		args = appendScale(args, request)
+		args = appendVideoFilters(args, request, info)
 		args = append(args, "-pix_fmt", "yuv420p")
 	case tenBitSource:
-		args = appendScale(args, request)
+		args = appendVideoFilters(args, request, info)
 		args = append(args, "-pix_fmt", "yuv420p10le")
 	default:
-		args = appendScale(args, request)
+		args = appendVideoFilters(args, request, info)
 		args = append(args, "-pix_fmt", "yuv420p")
 	}
 	return args
 }
 
-func appendScale(args []string, request EncodeRequest) []string {
-	if request.ScaleHeight <= 0 {
+func appendVideoFilters(args []string, request EncodeRequest, info VideoInfo) []string {
+	filters := make([]string, 0, 2)
+	if filter := frameRateFilter(request, info); filter != "" {
+		filters = append(filters, filter)
+	}
+	if request.ScaleHeight > 0 {
+		filters = append(filters, fmt.Sprintf("scale=%d:%d:flags=lanczos", request.ScaleWidth, request.ScaleHeight))
+	}
+	if len(filters) == 0 {
 		return args
 	}
-	return append(args, "-vf", fmt.Sprintf("scale=%d:%d:flags=lanczos", request.ScaleWidth, request.ScaleHeight))
+	return append(args, "-vf", strings.Join(filters, ","))
+}
+
+// effectiveOutputFPS returns the frame rate used for encoding and progress.
+// A zero request preserves the source cadence, including variable frame rate.
+func effectiveOutputFPS(request EncodeRequest, info VideoInfo) float64 {
+	if request.OutputFPS >= minimumOutputFPS && (info.FPS <= 0 || request.OutputFPS < info.FPS) {
+		return request.OutputFPS
+	}
+	return info.FPS
+}
+
+func frameRateFilter(request EncodeRequest, info VideoInfo) string {
+	fps := effectiveOutputFPS(request, info)
+	if request.OutputFPS < minimumOutputFPS || info.FPS <= 0 || fps >= info.FPS-0.001 {
+		return ""
+	}
+	return "fps=" + strconv.FormatFloat(fps, 'f', 3, 64)
 }
 
 // scaleDimensions maps a target height onto the source aspect ratio with even
@@ -857,6 +911,31 @@ func proportionalVideoCorrection(requestedKbps, actualKbps, budgetKbps int) int 
 	return int(math.Floor(float64(requestedKbps) * float64(budgetKbps) / float64(actualKbps) * 0.992))
 }
 
+// correctionHitBitrateFloor compares two completed attempts at the same
+// resolution. A hardware encoder is at a confirmed floor when a meaningful
+// request reduction yields less than half as much delivered-bitrate reduction
+// and the newest stream still exceeds its budget. This direct comparison
+// avoids spending another full pass on a bitrate the encoder cannot reach.
+func correctionHitBitrateFloor(previousRequestedKbps, previousActualKbps, requestedKbps, actualKbps, budgetKbps int) bool {
+	if previousRequestedKbps <= 0 || previousActualKbps <= 0 || requestedKbps <= 0 || actualKbps <= budgetKbps {
+		return false
+	}
+	requestedDrop := previousRequestedKbps - requestedKbps
+	minimumProbeDrop := previousRequestedKbps / 20
+	if minimumProbeDrop < 4 {
+		minimumProbeDrop = 4
+	}
+	if requestedDrop < minimumProbeDrop {
+		return false
+	}
+	actualDrop := previousActualKbps - actualKbps
+	minimumResponse := requestedDrop / 2
+	if minimumResponse < 3 {
+		minimumResponse = 3
+	}
+	return actualDrop < minimumResponse
+}
+
 // likelyAV1VAAPIBitrateFloor recognizes the severe low-bits-per-pixel miss
 // seen when AV1 VAAPI reaches its quantizer floor. A normal correction cannot
 // reclaim this much bitrate, so the correction path should try the minimum
@@ -872,7 +951,7 @@ func likelyAV1VAAPIBitrateFloor(request EncodeRequest, info VideoInfo, requested
 	if request.ScaleWidth > 0 && request.ScaleHeight > 0 {
 		width, height = request.ScaleWidth, request.ScaleHeight
 	}
-	fps := info.FPS
+	fps := effectiveOutputFPS(request, info)
 	if width <= 0 || height <= 0 || fps <= 0 {
 		return false
 	}
@@ -895,8 +974,9 @@ func minimumBitrateRetry(requestedKbps int) (int, bool) {
 // 15% margin, since the excess grows slightly as requests shrink), or
 // hopeless=true when the excess consumes over 60% of the budget and an
 // ordinary correction is no longer useful. The caller then tries the minimum
-// bitrate before considering a lower resolution. Both zero values mean the
-// overshoot was not additive; the caller falls back to proportional correction.
+// bitrate before considering a lower resolution unless attempt history already
+// confirmed the floor. Both zero values mean the overshoot was not additive;
+// the caller falls back to proportional correction.
 func hardwareCorrection(budgetKbps, requestedKbps, actualKbps int) (int, bool) {
 	excess := actualKbps - requestedKbps
 	if excess <= 0 {
@@ -959,7 +1039,9 @@ func calculateVideoBitrate(request EncodeRequest, info VideoInfo) (int, error) {
 	if request.TargetBytes <= 0 || info.Duration <= 0 {
 		return 0, errors.New("target size and duration must be greater than zero")
 	}
-	reserve := estimatedMuxOverheadBytes(request.Container, info, request.AudioCodec)
+	outputInfo := info
+	outputInfo.FPS = effectiveOutputFPS(request, info)
+	reserve := estimatedMuxOverheadBytes(request.Container, outputInfo, request.AudioCodec)
 	usableBits := float64(request.TargetBytes-reserve) * 8
 	if usableBits <= 0 {
 		return 0, errors.New("the target size is too small")
@@ -1083,6 +1165,9 @@ func validateEncodeRequest(request EncodeRequest) error {
 	if !allowedResolutionHeights[request.ResolutionHeight] {
 		return errors.New("select a supported output resolution")
 	}
+	if request.OutputFPS != 0 && (math.IsNaN(request.OutputFPS) || math.IsInf(request.OutputFPS, 0) || request.OutputFPS < minimumOutputFPS) {
+		return fmt.Errorf("output frame rate must be at least %d fps", minimumOutputFPS)
+	}
 	return nil
 }
 
@@ -1103,6 +1188,14 @@ func validateAudioBitrate(codec string, bitrateKbps int) error {
 func (j *Job) validateWithProbe(info VideoInfo) error {
 	if info.Duration <= 0 {
 		return errors.New("the input video has no usable duration")
+	}
+	if !j.request.Remux && j.request.OutputFPS > 0 {
+		if info.FPS <= 0 {
+			return errors.New("the input frame rate could not be determined")
+		}
+		if j.request.OutputFPS > info.FPS+0.001 {
+			return errors.New("the output frame rate cannot exceed the input frame rate")
+		}
 	}
 	if stat, err := os.Stat(filepath.Dir(j.request.Output)); err == nil && !stat.IsDir() {
 		return errors.New("the selected output folder is invalid")

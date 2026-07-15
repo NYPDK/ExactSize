@@ -29,6 +29,27 @@ func TestCalculateVideoBitrateBudgetsAudioAndOverhead(t *testing.T) {
 	}
 }
 
+func TestCalculateVideoBitrateUsesReducedOutputFrameRateForMuxReserve(t *testing.T) {
+	request := validTestRequest()
+	request.TargetBytes = 15_000_000
+	request.Container = "webm"
+	request.AudioCodec = "opus"
+	info := VideoInfo{Duration: 300, FPS: 60, AudioTracks: 2, AudioSampleRate: 48_000}
+
+	sourceRate, err := calculateVideoBitrate(request, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.OutputFPS = 15
+	reducedRate, err := calculateVideoBitrate(request, info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reducedRate <= sourceRate {
+		t.Fatalf("lower FPS should reserve fewer mux bytes: source=%d kbps reduced=%d kbps", sourceRate, reducedRate)
+	}
+}
+
 func TestCalculateVideoBitrateRejectsImpossibleTarget(t *testing.T) {
 	request := validTestRequest()
 	request.TargetBytes = 1_000_000
@@ -199,6 +220,23 @@ func TestDownscaleArgs(t *testing.T) {
 	assertArgs(t, software, "-vf", "scale=1280:720:flags=lanczos")
 }
 
+func TestFrameRateFilterArgs(t *testing.T) {
+	info := VideoInfo{PixelFormat: "yuv420p", FPS: 60}
+	request := EncodeRequest{Encoder: "av1_vaapi", VideoCodec: "av1", Preset: "balanced", OutputFPS: 30, ScaleWidth: 1280, ScaleHeight: 720}
+	vaapi := videoEncoderArgs(request, info, 400)
+	assertArgs(t, vaapi, "-vf", "fps=30.000,format=nv12,hwupload,scale_vaapi=1280:720")
+
+	software := videoEncoderArgs(EncodeRequest{Encoder: "libx264", VideoCodec: "h264", Preset: "balanced", OutputFPS: 24}, info, 400)
+	assertArgs(t, software, "-vf", "fps=24.000")
+
+	request.OutputFPS = 60
+	sourceRate := videoEncoderArgs(request, info, 400)
+	assertArgs(t, sourceRate, "-vf", "format=nv12,hwupload,scale_vaapi=1280:720")
+	if got := effectiveOutputFPS(EncodeRequest{OutputFPS: 30}, info); got != 30 {
+		t.Fatalf("effective output FPS = %v, want 30", got)
+	}
+}
+
 func TestScaleDimensions(t *testing.T) {
 	tests := []struct {
 		sourceW, sourceH, target int
@@ -229,6 +267,27 @@ func TestValidateResolutionHeight(t *testing.T) {
 	request.ResolutionHeight = 123
 	if err := validateEncodeRequest(request); err == nil {
 		t.Fatal("arbitrary resolutions must be rejected")
+	}
+}
+
+func TestValidateOutputFrameRate(t *testing.T) {
+	request := validTestRequest()
+	request.OutputFPS = 4.99
+	if err := validateEncodeRequest(request); err == nil {
+		t.Fatal("output below 5 fps must be rejected")
+	}
+
+	request.OutputFPS = 30
+	if err := validateEncodeRequest(request); err != nil {
+		t.Fatalf("30 fps should validate before probing: %v", err)
+	}
+	job := newJob(request)
+	if err := job.validateWithProbe(VideoInfo{Duration: 60, FPS: 60}); err != nil {
+		t.Fatalf("output below the input frame rate should validate: %v", err)
+	}
+	job.request.OutputFPS = 61
+	if err := job.validateWithProbe(VideoInfo{Duration: 60, FPS: 60}); err == nil {
+		t.Fatal("output above the input frame rate must be rejected")
 	}
 }
 
@@ -287,6 +346,24 @@ func TestLikelyAV1VAAPIBitrateFloor(t *testing.T) {
 	request.Encoder = "av1_vaapi"
 	if likelyAV1VAAPIBitrateFloor(request, info, 2000, 2800, 2200) {
 		t.Fatal("a healthy bits-per-pixel budget should not be classified as the low-rate floor")
+	}
+}
+
+func TestCorrectionHitBitrateFloor(t *testing.T) {
+	if !correctionHitBitrateFloor(400, 520, 300, 515, 380) {
+		t.Fatal("a 100 kbps request cut with only a 5 kbps output response should confirm a bitrate floor")
+	}
+	if correctionHitBitrateFloor(400, 520, 300, 445, 380) {
+		t.Fatal("a responsive encoder should continue with bitrate correction")
+	}
+	if correctionHitBitrateFloor(400, 520, 300, 375, 380) {
+		t.Fatal("an output already within budget is not a blocking floor")
+	}
+	if correctionHitBitrateFloor(400, 520, 395, 519, 380) {
+		t.Fatal("a tiny request change is not enough evidence to declare a floor")
+	}
+	if correctionHitBitrateFloor(300, 515, 320, 520, 380) {
+		t.Fatal("raising the requested bitrate cannot prove a lower bitrate floor")
 	}
 }
 

@@ -6,6 +6,7 @@ const $ = (id) => document.getElementById(id);
 
 const elements = {
   appHeader: $("appHeader"),
+  appVersion: $("appVersion"),
   runtimeStatus: $("runtimeStatus"),
   runtimeLabel: $("runtimeLabel"),
   themeColor: $("themeColor"),
@@ -14,6 +15,9 @@ const elements = {
   quitButton: $("quitButton"),
   resizeGrip: $("resizeGrip"),
   resolution: $("resolution"),
+  frameRateRow: $("frameRateRow"),
+  frameRate: $("frameRate"),
+  frameRateValue: $("frameRateValue"),
   dropZone: $("dropZone"),
   fileInput: $("fileInput"),
   emptyInputCopy: $("emptyInputCopy"),
@@ -139,11 +143,16 @@ async function initialize() {
   setRuntime("Starting…", "busy");
   try {
     state.appStatus = await api("/api/status");
+    if (state.appStatus.version) {
+      elements.appVersion.textContent = `v${state.appStatus.version}`;
+      elements.appVersion.hidden = false;
+    }
     if (!state.appStatus.encoders?.length) {
       throw new Error("The bundled FFmpeg build has no supported video encoders.");
     }
     refreshCompatibility();
     refreshResolutionOptions();
+    refreshFrameRateControl(true);
     setupFramelessWindow();
     updateSizePresetSelection();
     setRuntime("Ready", "ready");
@@ -186,6 +195,60 @@ function refreshResolutionOptions() {
     options.push({ value: String(height), label: `${height}p` });
   }
   replaceOptions(elements.resolution, options, elements.resolution.value || "0");
+}
+
+function refreshFrameRateControl(resetToSource = false) {
+  const sourceFPS = Number(state.input?.fps || 0);
+  const available = Number.isFinite(sourceFPS) && sourceFPS > 0;
+  if (!available) {
+    elements.frameRate.min = "5";
+    elements.frameRate.max = "5";
+    elements.frameRate.value = "5";
+    elements.frameRate.disabled = true;
+    elements.frameRateRow.classList.add("unavailable");
+    elements.frameRate.style.setProperty("--range-progress", "0%");
+    elements.frameRateValue.textContent = "Select video";
+    elements.frameRate.setAttribute("aria-valuetext", "Select a video first");
+    return;
+  }
+
+  const minimum = Math.min(5, Math.max(1, Math.floor(sourceFPS)));
+  const maximum = Math.max(5, Math.ceil(sourceFPS));
+  elements.frameRate.min = String(minimum);
+  elements.frameRate.max = String(maximum);
+  const current = Number(elements.frameRate.value);
+  if (resetToSource || !Number.isFinite(current) || current < minimum || current > maximum) {
+    elements.frameRate.value = String(maximum);
+  }
+  const reducible = sourceFPS > 5;
+  elements.frameRate.disabled = state.encoding || !reducible;
+  elements.frameRateRow.classList.toggle("unavailable", !reducible);
+  updateFrameRateLabel();
+}
+
+function updateFrameRateLabel() {
+  const sourceFPS = Number(state.input?.fps || 0);
+  const selected = Number(elements.frameRate.value || 0);
+  if (!sourceFPS || !selected) return;
+  const maximum = Number(elements.frameRate.max || Math.ceil(sourceFPS));
+  const atSource = selected >= maximum;
+  const minimum = Number(elements.frameRate.min || 5);
+  const span = maximum - minimum;
+  const progress = span > 0 ? ((selected - minimum) / span) * 100 : 100;
+  elements.frameRate.style.setProperty("--range-progress", `${Math.max(0, Math.min(100, progress))}%`);
+  const label = atSource
+    ? `Source · ${trimNumber(sourceFPS, 2)} fps`
+    : `${Math.round(selected)} fps`;
+  elements.frameRateValue.textContent = label;
+  elements.frameRate.setAttribute("aria-valuetext", label);
+}
+
+function requestedOutputFPS() {
+  const sourceFPS = Number(state.input?.fps || 0);
+  const selected = Number(elements.frameRate.value || 0);
+  const maximum = Number(elements.frameRate.max || 0);
+  if (!sourceFPS || !selected || selected >= maximum) return 0;
+  return Math.round(selected);
 }
 
 function setupFramelessWindow() {
@@ -261,6 +324,10 @@ function bindEvents() {
     updateFormState();
   });
   elements.audioBitrate.addEventListener("change", updateEstimate);
+  elements.frameRate.addEventListener("input", () => {
+    updateFrameRateLabel();
+    updateEstimate();
+  });
   elements.sizePresets.addEventListener("click", (event) => {
     const button = event.target.closest("button");
     if (!button || state.encoding) return;
@@ -368,6 +435,7 @@ async function loadInputPath(path, displayName, isTemp = false) {
     renderInput();
     chooseSensibleDefaults(info);
     refreshResolutionOptions();
+    refreshFrameRateControl(true);
     setSuggestedOutput();
     updateEstimate();
     updateFormState();
@@ -416,6 +484,7 @@ function resetInputDisplay() {
   elements.fileSummary.hidden = true;
   elements.changeFile.hidden = true;
   refreshResolutionOptions();
+  refreshFrameRateControl(true);
   updateFormState();
 }
 
@@ -569,6 +638,7 @@ async function startCompression() {
         audioChannels: elements.audioChannels.value,
         twoPass: elements.twoPass.checked,
         resolutionHeight: Number(elements.resolution.value || 0),
+        outputFps: requestedOutputFPS(),
       }),
     });
     pollJob();
@@ -664,6 +734,7 @@ function setEncodingState(encoding) {
   if (!encoding) {
     elements.cancelButton.disabled = false;
     refreshCompatibility();
+    refreshFrameRateControl(false);
     updateFormState();
   }
   setRuntime(encoding ? "Encoding" : "Ready", encoding ? "busy" : "ready");
@@ -738,7 +809,9 @@ function updateEstimate() {
     elements.bitrateEstimate.textContent = "Target is too small for this duration";
     return;
   }
-  elements.bitrateEstimate.textContent = `Estimated video bitrate: ${formatBitrate(videoKbps)}${tracks ? ` · Audio: ${audioKbps} kbps total` : " · No audio"}`;
+  const outputFPS = requestedOutputFPS();
+  const frameRateSummary = outputFPS ? ` · Output: ${trimNumber(outputFPS, 2)} fps` : "";
+  elements.bitrateEstimate.textContent = `Estimated video bitrate: ${formatBitrate(videoKbps)}${tracks ? ` · Audio: ${audioKbps} kbps total` : " · No audio"}${frameRateSummary}`;
 }
 
 function isFormValid() {

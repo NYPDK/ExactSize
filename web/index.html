@@ -15,6 +15,7 @@
       <div class="brand" aria-label="ExactSize">
         <img class="brand-mark" src="/icon.svg" alt="">
         <span class="brand-name">ExactSize</span>
+        <span class="brand-version" id="appVersion" hidden></span>
       </div>
       <div class="runtime-status" id="runtimeStatus">
         <span class="status-dot" aria-hidden="true"></span>
@@ -144,6 +145,13 @@
               <label class="field-row">
                 <span>Resolution</span>
                 <select id="resolution"></select>
+              </label>
+              <label class="field-row frame-rate-row" id="frameRateRow">
+                <span>Frame rate</span>
+                <span class="frame-rate-control">
+                  <input id="frameRate" type="range" min="5" max="60" step="1" value="60" disabled>
+                  <output id="frameRateValue" for="frameRate">Select video</output>
+                </span>
               </label>
               <label class="field-row">
                 <span>Speed / quality</span>

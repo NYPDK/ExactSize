@@ -37,13 +37,13 @@ type App struct {
 }
 
 type AppStatus struct {
-	Version       string        `json:"version"`
-	FFmpegVersion string        `json:"ffmpegVersion"`
-	Encoders      []EncoderInfo `json:"encoders"`
-	AudioEncoders []string      `json:"audioEncoders"`
-	NativeDialog  bool          `json:"nativeDialog"`
-	Frameless     bool          `json:"frameless"`
-	DefaultOutputDir string     `json:"defaultOutputDir"`
+	Version          string        `json:"version"`
+	FFmpegVersion    string        `json:"ffmpegVersion"`
+	Encoders         []EncoderInfo `json:"encoders"`
+	AudioEncoders    []string      `json:"audioEncoders"`
+	NativeDialog     bool          `json:"nativeDialog"`
+	Frameless        bool          `json:"frameless"`
+	DefaultOutputDir string        `json:"defaultOutputDir"`
 }
 
 // xdgUserDir reads one entry from ~/.config/user-dirs.dirs (for example
@@ -447,7 +447,12 @@ if (target && target.caption === "ExactSize") {
 // KWin's plain-JS environment has no Qt.rect; assigning an object literal to
 // frameGeometry works.
 const moveUpdate = `target.frameGeometry = { x: start.x + dx, y: start.y + dy, width: start.width, height: start.height };`
-const resizeUpdate = `target.frameGeometry = { x: start.x, y: start.y, width: Math.max(1040, start.width + dx), height: Math.max(620, start.height + dy) };`
+
+var resizeUpdate = fmt.Sprintf(
+	`target.frameGeometry = { x: start.x, y: start.y, width: Math.max(%d, start.width + dx), height: Math.max(%d, start.height + dy) };`,
+	minimumWindowWidth,
+	minimumWindowHeight,
+)
 
 func (a *App) handleWindowAction(w http.ResponseWriter, r *http.Request) {
 	if !hasKWinScripting() {

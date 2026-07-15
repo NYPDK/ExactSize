@@ -5,8 +5,8 @@ A local Linux video compressor with one promise: the output is **never larger th
 ## Run it
 
 ```bash
-chmod +x ExactSize-1.8.7-x86_64.AppImage
-./ExactSize-1.8.7-x86_64.AppImage
+chmod +x ExactSize-1.8.12-x86_64.AppImage
+./ExactSize-1.8.12-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
@@ -16,7 +16,7 @@ FFmpeg is bundled. On first run the AppImage adds itself to your app menu with i
 - **Strict size ceiling**: packet-aware container overhead is budgeted up front, then encodes are measured stream by stream and auto-corrected until they fit; an oversized attempt never replaces your output.
 - **GPU encoding**: NVENC, Quick Sync, VAAPI, and AMF. Every encoder is test-run at launch, so only ones that actually work on your machine are offered, and they're preferred by default.
 - **Modern codecs**: H.264, H.265, H.266/VVC, AV1, VP9. AV2 is wired up and unlocks itself the moment FFmpeg ships an encoder.
-- **Quick presets**: one-click size targets (10–200 MB), speed/quality tiers from Fastest to Higher quality, and Auto resolution that downscales only when the GPU can't otherwise hit the target.
+- **Quick presets**: one-click size targets (10–200 MB), speed/quality tiers from Fastest to Higher quality, a 5 fps-to-source frame-rate slider, and Auto resolution that downscales only when the GPU can't otherwise hit the target.
 - **Remux / Mux**: switch containers losslessly without re-encoding; if only the audio doesn't fit the new container, Mux copies the video untouched and converts just the audio.
 - **Drag & drop that behaves**: dropped files keep their real location, so outputs land next to the source, not in /tmp.
 - **At home on KDE**: frameless window with native drag, resize, and rounded corners.
