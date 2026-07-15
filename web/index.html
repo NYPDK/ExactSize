@@ -146,13 +146,26 @@
                 <span>Resolution</span>
                 <select id="resolution"></select>
               </label>
-              <label class="field-row frame-rate-row" id="frameRateRow">
-                <span>Frame rate</span>
-                <span class="frame-rate-control">
-                  <input id="frameRate" type="range" min="5" max="60" step="1" value="60" disabled>
-                  <output id="frameRateValue" for="frameRate">Select video</output>
+              <label class="toggle-row" id="autoResolutionRow">
+                <input id="autoResolution" type="checkbox" checked>
+                <span class="toggle" aria-hidden="true"></span>
+                <span>
+                  <strong>Automatic resolution</strong>
+                  <small>Reduce only after bitrate and FPS options are exhausted</small>
                 </span>
               </label>
+              <div class="field-row frame-rate-row" id="frameRateRow">
+                <span>Frame rate</span>
+                <span class="frame-rate-control">
+                  <span class="frame-rate-slider strict" id="frameRateSlider">
+                    <span class="frame-rate-track" aria-hidden="true"></span>
+                    <span class="frame-rate-selection" aria-hidden="true"></span>
+                    <input class="frame-rate-range frame-rate-minimum" id="frameRateMinimum" type="range" min="5" max="60" step="1" value="5" aria-label="Minimum acceptable frame rate" title="Leave at 5 FPS to lock the maximum; move it up to allow adaptive reduction" disabled>
+                    <input class="frame-rate-range frame-rate-maximum" id="frameRateMaximum" type="range" min="5" max="60" step="1" value="60" aria-label="Maximum frame rate" disabled>
+                  </span>
+                  <output id="frameRateValue" for="frameRateMinimum frameRateMaximum">Select video</output>
+                </span>
+              </div>
               <label class="field-row">
                 <span>Speed / quality</span>
                 <select id="preset">
@@ -234,7 +247,7 @@
           </div>
           <div class="progress-stats">
             <div class="stat">
-              <span>Stage</span>
+              <span id="progressPassLabel">Stage</span>
               <strong id="progressPass">Not started</strong>
             </div>
             <div class="stat">

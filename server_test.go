@@ -7,13 +7,16 @@ import (
 	"testing"
 )
 
-func TestFrameRateSliderUsesWholeNumberSteps(t *testing.T) {
+func TestFrameRateRangeUsesTwoWholeNumberHandles(t *testing.T) {
 	html, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(html), `id="frameRate" type="range" min="5" max="60" step="1"`) {
-		t.Fatal("frame-rate slider must advance in whole-number steps")
+	markup := string(html)
+	for _, handle := range []string{"frameRateMinimum", "frameRateMaximum"} {
+		if !strings.Contains(markup, `id="`+handle+`" type="range" min="5" max="60" step="1"`) {
+			t.Fatalf("%s must be a whole-number range handle", handle)
+		}
 	}
 
 	javascript, err := webAssets.ReadFile("web/app.js")
@@ -21,8 +24,53 @@ func TestFrameRateSliderUsesWholeNumberSteps(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(javascript)
-	if !strings.Contains(script, "Math.ceil(sourceFPS)") || !strings.Contains(script, "return Math.round(selected)") {
-		t.Fatal("fractional source rates must keep a source position while reduced rates stay whole numbers")
+	for _, behavior := range []string{"Math.ceil(sourceFPS)", "requestedMinimumOutputFPS", "selectedMinimum <= absoluteMinimum", "const startProgress = strict ? 0", "minimumOutputFps: requestedMinimumOutputFPS()"} {
+		if !strings.Contains(script, behavior) {
+			t.Fatalf("frame-rate range is missing %q behavior", behavior)
+		}
+	}
+}
+
+func TestStartingResolutionAndAutomaticFallbackAreSeparateControls(t *testing.T) {
+	html, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markup := string(html)
+	for _, control := range []string{`id="resolution"`, `id="autoResolution" type="checkbox" checked`, `Automatic resolution`} {
+		if !strings.Contains(markup, control) {
+			t.Fatalf("resolution settings are missing %q", control)
+		}
+	}
+	javascript, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(javascript)
+	for _, behavior := range []string{"Source (${state.input.width} × ${sourceHeight})", "autoResolution: elements.autoResolution.checked"} {
+		if !strings.Contains(script, behavior) {
+			t.Fatalf("resolution controls are missing %q behavior", behavior)
+		}
+	}
+}
+
+func TestProgressPanelDoesNotRepeatEncoding(t *testing.T) {
+	html, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(html), `id="progressPassLabel"`) {
+		t.Fatal("the progress metric needs a dynamic label")
+	}
+	javascript, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(javascript)
+	for _, behavior := range []string{"function progressMetric(job)", `label: "Video"`, `details.push(formatBitrate(bitrate))`, "details.push(`${trimNumber(fps, 2)} fps`)"} {
+		if !strings.Contains(script, behavior) {
+			t.Fatalf("progress panel is missing %q", behavior)
+		}
 	}
 }
 

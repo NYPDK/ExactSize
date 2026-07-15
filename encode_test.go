@@ -237,6 +237,54 @@ func TestFrameRateFilterArgs(t *testing.T) {
 	}
 }
 
+func TestAdaptiveFrameRateCorrection(t *testing.T) {
+	info := VideoInfo{FPS: 60}
+	request := EncodeRequest{MinimumOutputFPS: 30}
+	if got := adaptiveMinimumOutputFPS(request, info); got != 30 {
+		t.Fatalf("adaptive minimum = %v, want 30", got)
+	}
+	if got, ok := nextAdaptiveOutputFPS(request, info, 600, 400, false); !ok || got != 45 {
+		t.Fatalf("first adaptive FPS = %v, %v; want midpoint 45, true", got, ok)
+	}
+	if got, ok := nextAdaptiveOutputFPS(request, info, 1200, 400, false); !ok || got != 45 {
+		t.Fatalf("the first FPS correction must remain the midpoint even on a large miss, got %v, %v", got, ok)
+	}
+	if got, ok := nextAdaptiveOutputFPS(request, info, 600, 400, true); !ok || got != 30 {
+		t.Fatalf("the second FPS correction should exhaust the range, got %v, %v", got, ok)
+	}
+
+	request.OutputFPS = 30
+	if _, ok := nextAdaptiveOutputFPS(request, info, 600, 400, false); ok {
+		t.Fatal("correction must stop after reaching the selected minimum")
+	}
+	request = EncodeRequest{MinimumOutputFPS: minimumOutputFPS}
+	if got := adaptiveMinimumOutputFPS(request, info); got != 0 {
+		t.Fatalf("the absolute-low minimum handle must lock the maximum, got %v", got)
+	}
+	if _, ok := nextAdaptiveOutputFPS(request, info, 600, 400, false); ok {
+		t.Fatal("the absolute-low minimum handle must disable adaptive correction")
+	}
+}
+
+func TestCorrectionAttemptLimitRestartsBitrateCycleAtEveryFPS(t *testing.T) {
+	info := VideoInfo{FPS: 60}
+	fixed := EncodeRequest{}
+	if got := correctionAttemptLimit(fixed, info, false); got != maximumEncodeAttempts {
+		t.Fatalf("fixed-rate attempt limit = %d, want %d", got, maximumEncodeAttempts)
+	}
+
+	adaptive := EncodeRequest{MinimumOutputFPS: 30}
+	wantAdaptive := maximumEncodeAttempts * 3
+	if got := correctionAttemptLimit(adaptive, info, false); got != wantAdaptive {
+		t.Fatalf("adaptive attempt limit = %d, want %d for maximum/midpoint/minimum bitrate cycles", got, wantAdaptive)
+	}
+
+	wantAdaptiveResolution := maximumEncodeAttempts * (3 + len(downscaleLadder))
+	if got := correctionAttemptLimit(adaptive, info, true); got != wantAdaptiveResolution {
+		t.Fatalf("adaptive-resolution attempt limit = %d, want %d", got, wantAdaptiveResolution)
+	}
+}
+
 func TestScaleDimensions(t *testing.T) {
 	tests := []struct {
 		sourceW, sourceH, target int
@@ -258,6 +306,29 @@ func TestScaleDimensions(t *testing.T) {
 	}
 }
 
+func TestStartingResolutionIsIndependentFromAutomaticFallback(t *testing.T) {
+	info := VideoInfo{Width: 1920, Height: 1080}
+	tests := []struct {
+		name                  string
+		request               EncodeRequest
+		wantW, wantH          int
+		wantAutomaticFallback bool
+	}{
+		{"fixed source", EncodeRequest{}, 0, 0, false},
+		{"adaptive source", EncodeRequest{AutoResolution: true}, 0, 0, true},
+		{"fixed 720p", EncodeRequest{ResolutionHeight: 720}, 1280, 720, false},
+		{"adaptive 720p", EncodeRequest{ResolutionHeight: 720, AutoResolution: true}, 1280, 720, true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			width, height, automaticFallback := startingResolution(test.request, info)
+			if width != test.wantW || height != test.wantH || automaticFallback != test.wantAutomaticFallback {
+				t.Fatalf("startingResolution = %d×%d, %v; want %d×%d, %v", width, height, automaticFallback, test.wantW, test.wantH, test.wantAutomaticFallback)
+			}
+		})
+	}
+}
+
 func TestValidateResolutionHeight(t *testing.T) {
 	request := validTestRequest()
 	request.ResolutionHeight = 720
@@ -276,18 +347,34 @@ func TestValidateOutputFrameRate(t *testing.T) {
 	if err := validateEncodeRequest(request); err == nil {
 		t.Fatal("output below 5 fps must be rejected")
 	}
+	request.OutputFPS = 29.97
+	if err := validateEncodeRequest(request); err == nil {
+		t.Fatal("the FPS slider must only accept whole-number maximums")
+	}
 
 	request.OutputFPS = 30
+	request.MinimumOutputFPS = 24
 	if err := validateEncodeRequest(request); err != nil {
-		t.Fatalf("30 fps should validate before probing: %v", err)
+		t.Fatalf("24–30 fps should validate before probing: %v", err)
 	}
 	job := newJob(request)
 	if err := job.validateWithProbe(VideoInfo{Duration: 60, FPS: 60}); err != nil {
-		t.Fatalf("output below the input frame rate should validate: %v", err)
+		t.Fatalf("a range below the input frame rate should validate: %v", err)
 	}
 	job.request.OutputFPS = 61
 	if err := job.validateWithProbe(VideoInfo{Duration: 60, FPS: 60}); err == nil {
 		t.Fatal("output above the input frame rate must be rejected")
+	}
+	request.OutputFPS = 30
+	request.MinimumOutputFPS = 31
+	if err := validateEncodeRequest(request); err == nil {
+		t.Fatal("minimum FPS above a fixed maximum must be rejected")
+	}
+	request.OutputFPS = 0
+	request.MinimumOutputFPS = 61
+	job = newJob(request)
+	if err := job.validateWithProbe(VideoInfo{Duration: 60, FPS: 60}); err == nil {
+		t.Fatal("minimum FPS above a source-rate maximum must be rejected")
 	}
 }
 
@@ -373,6 +460,46 @@ func TestMinimumBitrateRetryBeforeDownscale(t *testing.T) {
 	}
 	if bitrate, ok := minimumBitrateRetry(minimumVideoBitrateKbps); ok || bitrate != 0 {
 		t.Fatalf("the minimum bitrate must be exhausted before downscaling, got %d, %v", bitrate, ok)
+	}
+}
+
+func TestBitrateOptionsGateFPSAndResolutionFallback(t *testing.T) {
+	if bitrateOptionsExhausted(409, false) {
+		t.Fatal("an untried lower bitrate must block FPS and resolution fallback")
+	}
+	if !bitrateOptionsExhausted(minimumVideoBitrateKbps, false) {
+		t.Fatal("a completed minimum-bitrate attempt must unlock adaptive fallback")
+	}
+	if !bitrateOptionsExhausted(300, true) {
+		t.Fatal("a measured encoder floor must unlock adaptive fallback")
+	}
+	if bitrateOptionsExhausted(300, false) {
+		t.Fatal("each new FPS tier must restart bitrate correction instead of bypassing it")
+	}
+}
+
+func TestBitrateCorrectionMessageNamesEveryChangedValue(t *testing.T) {
+	message := bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 45)
+	for _, detail := range []string{"from 409 to 64 kbps", "at 45 fps", "before trying a lower frame rate or resolution"} {
+		if !strings.Contains(message, detail) {
+			t.Fatalf("correction message %q is missing %q", message, detail)
+		}
+	}
+}
+
+func TestRunFFmpegPreservesUsefulCorrectionMessage(t *testing.T) {
+	tempDir := t.TempDir()
+	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
+	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nprintf 'out_time_us=1000000\\nprogress=end\\n'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	job := newJob(validTestRequest())
+	job.status.Message = bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 30)
+	if err := job.runFFmpeg(ffmpeg, nil, 1, 30, 1, 1, 2, filepath.Join(tempDir, "output.webm")); err != nil {
+		t.Fatal(err)
+	}
+	if got := job.snapshot().Message; got != bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 30) {
+		t.Fatalf("encoding replaced useful correction context with %q", got)
 	}
 }
 

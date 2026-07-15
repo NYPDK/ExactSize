@@ -15,8 +15,11 @@ const elements = {
   quitButton: $("quitButton"),
   resizeGrip: $("resizeGrip"),
   resolution: $("resolution"),
+  autoResolution: $("autoResolution"),
   frameRateRow: $("frameRateRow"),
-  frameRate: $("frameRate"),
+  frameRateSlider: $("frameRateSlider"),
+  frameRateMinimum: $("frameRateMinimum"),
+  frameRateMaximum: $("frameRateMaximum"),
   frameRateValue: $("frameRateValue"),
   dropZone: $("dropZone"),
   fileInput: $("fileInput"),
@@ -51,6 +54,7 @@ const elements = {
   progressPercent: $("progressPercent"),
   progressEyeline: $("progressEyeline"),
   progressHeading: $("progressHeading"),
+  progressPassLabel: $("progressPassLabel"),
   progressPass: $("progressPass"),
   progressSize: $("progressSize"),
   progressElapsed: $("progressElapsed"),
@@ -189,7 +193,7 @@ function updateSizePresetSelection() {
 
 function refreshResolutionOptions() {
   const sourceHeight = state.input?.height || 0;
-  const options = [{ value: "0", label: sourceHeight ? `Auto (${state.input.width} × ${sourceHeight}, adapts to fit)` : "Auto (source, adapts to fit)" }];
+  const options = [{ value: "0", label: sourceHeight ? `Source (${state.input.width} × ${sourceHeight})` : "Source resolution" }];
   for (const height of resolutionLadder) {
     if (sourceHeight && height >= sourceHeight) continue;
     options.push({ value: String(height), label: `${height}p` });
@@ -200,55 +204,110 @@ function refreshResolutionOptions() {
 function refreshFrameRateControl(resetToSource = false) {
   const sourceFPS = Number(state.input?.fps || 0);
   const available = Number.isFinite(sourceFPS) && sourceFPS > 0;
+  const controls = [elements.frameRateMinimum, elements.frameRateMaximum];
   if (!available) {
-    elements.frameRate.min = "5";
-    elements.frameRate.max = "5";
-    elements.frameRate.value = "5";
-    elements.frameRate.disabled = true;
+    controls.forEach((control) => {
+      control.min = "5";
+      control.max = "5";
+      control.value = "5";
+      control.disabled = true;
+      control.setAttribute("aria-valuetext", "Select a video first");
+    });
     elements.frameRateRow.classList.add("unavailable");
-    elements.frameRate.style.setProperty("--range-progress", "0%");
+    elements.frameRateSlider.classList.add("strict");
+    elements.frameRateSlider.style.setProperty("--range-start", "0%");
+    elements.frameRateSlider.style.setProperty("--range-end", "0%");
     elements.frameRateValue.textContent = "Select video";
-    elements.frameRate.setAttribute("aria-valuetext", "Select a video first");
+    elements.frameRateValue.title = "Select a video to configure its frame rate";
     return;
   }
 
   const minimum = Math.min(5, Math.max(1, Math.floor(sourceFPS)));
   const maximum = Math.max(5, Math.ceil(sourceFPS));
-  elements.frameRate.min = String(minimum);
-  elements.frameRate.max = String(maximum);
-  const current = Number(elements.frameRate.value);
-  if (resetToSource || !Number.isFinite(current) || current < minimum || current > maximum) {
-    elements.frameRate.value = String(maximum);
+  controls.forEach((control) => {
+    control.min = String(minimum);
+    control.max = String(maximum);
+  });
+  const currentMinimum = Number(elements.frameRateMinimum.value);
+  const currentMaximum = Number(elements.frameRateMaximum.value);
+  if (resetToSource || !Number.isFinite(currentMinimum) || !Number.isFinite(currentMaximum)) {
+    elements.frameRateMinimum.value = String(minimum);
+    elements.frameRateMaximum.value = String(maximum);
+  } else {
+    elements.frameRateMaximum.value = String(Math.max(minimum, Math.min(maximum, currentMaximum)));
+    const clampedMinimum = Math.max(minimum, Math.min(maximum, currentMinimum));
+    elements.frameRateMinimum.value = String(clampedMinimum >= Number(elements.frameRateMaximum.value) ? minimum : clampedMinimum);
   }
   const reducible = sourceFPS > 5;
-  elements.frameRate.disabled = state.encoding || !reducible;
+  controls.forEach((control) => { control.disabled = state.encoding || !reducible; });
   elements.frameRateRow.classList.toggle("unavailable", !reducible);
   updateFrameRateLabel();
 }
 
-function updateFrameRateLabel() {
+function updateFrameRateLabel(activeHandle = "") {
   const sourceFPS = Number(state.input?.fps || 0);
-  const selected = Number(elements.frameRate.value || 0);
-  if (!sourceFPS || !selected) return;
-  const maximum = Number(elements.frameRate.max || Math.ceil(sourceFPS));
-  const atSource = selected >= maximum;
-  const minimum = Number(elements.frameRate.min || 5);
-  const span = maximum - minimum;
-  const progress = span > 0 ? ((selected - minimum) / span) * 100 : 100;
-  elements.frameRate.style.setProperty("--range-progress", `${Math.max(0, Math.min(100, progress))}%`);
-  const label = atSource
-    ? `Source · ${trimNumber(sourceFPS, 2)} fps`
-    : `${Math.round(selected)} fps`;
+  const selectedMinimum = Number(elements.frameRateMinimum.value || 0);
+  const selectedMaximum = Number(elements.frameRateMaximum.value || 0);
+  if (!sourceFPS || !selectedMinimum || !selectedMaximum) return;
+  const absoluteMinimum = Number(elements.frameRateMinimum.min || 5);
+  const sourcePosition = Number(elements.frameRateMaximum.max || Math.ceil(sourceFPS));
+  const atSource = selectedMaximum >= sourcePosition;
+  const maximumFPS = atSource ? sourceFPS : Math.round(selectedMaximum);
+  const strict = selectedMinimum <= absoluteMinimum || selectedMinimum >= selectedMaximum;
+  const minimumFPS = strict ? maximumFPS : Math.round(selectedMinimum);
+  const span = sourcePosition - absoluteMinimum;
+  const toProgress = (value) => span > 0 ? ((value - absoluteMinimum) / span) * 100 : 100;
+  const endProgress = Math.max(0, Math.min(100, toProgress(selectedMaximum)));
+  // The floor position is a fixed-rate sentinel, not the start of a visible
+  // range. Render that state like a normal single-value slider: filled from
+  // the beginning through the selected maximum. The gray floor handle stays
+  // available as the affordance for opening an adaptive range.
+  const startProgress = strict ? 0 : Math.max(0, Math.min(endProgress, toProgress(selectedMinimum)));
+  elements.frameRateSlider.style.setProperty("--range-start", `${startProgress}%`);
+  elements.frameRateSlider.style.setProperty("--range-end", `${endProgress}%`);
+  elements.frameRateSlider.classList.toggle("strict", strict);
+  elements.frameRateSlider.classList.toggle("minimum-active", activeHandle === "minimum");
+  const label = strict
+    ? `Fixed · ${trimNumber(maximumFPS, 2)} fps`
+    : `${trimNumber(minimumFPS, 2)}–${trimNumber(maximumFPS, 2)} fps`;
+  const description = strict
+    ? `Fixed at ${trimNumber(maximumFPS, 2)} fps. Move the minimum handle above ${absoluteMinimum} fps to allow adaptive reduction.`
+    : `Adaptive range from ${trimNumber(minimumFPS, 2)} to ${trimNumber(maximumFPS, 2)} fps.`;
   elements.frameRateValue.textContent = label;
-  elements.frameRate.setAttribute("aria-valuetext", label);
+  elements.frameRateValue.title = description;
+  elements.frameRateMinimum.setAttribute("aria-valuetext", strict ? `Lock position; ${description}` : `Minimum ${trimNumber(minimumFPS, 2)} fps`);
+  elements.frameRateMaximum.setAttribute("aria-valuetext", `Maximum ${trimNumber(maximumFPS, 2)} fps${atSource ? ", source frame rate" : ""}`);
 }
 
 function requestedOutputFPS() {
   const sourceFPS = Number(state.input?.fps || 0);
-  const selected = Number(elements.frameRate.value || 0);
-  const maximum = Number(elements.frameRate.max || 0);
+  const selected = Number(elements.frameRateMaximum.value || 0);
+  const maximum = Number(elements.frameRateMaximum.max || 0);
   if (!sourceFPS || !selected || selected >= maximum) return 0;
   return Math.round(selected);
+}
+
+function requestedMinimumOutputFPS() {
+  const selectedMinimum = Number(elements.frameRateMinimum.value || 0);
+  const selectedMaximum = Number(elements.frameRateMaximum.value || 0);
+  const absoluteMinimum = Number(elements.frameRateMinimum.min || 5);
+  if (!selectedMinimum || selectedMinimum <= absoluteMinimum || selectedMinimum >= selectedMaximum) return 0;
+  return Math.round(selectedMinimum);
+}
+
+function handleFrameRateInput(activeHandle) {
+  let minimum = Number(elements.frameRateMinimum.value || 0);
+  let maximum = Number(elements.frameRateMaximum.value || 0);
+  const absoluteMinimum = Number(elements.frameRateMinimum.min || 5);
+  if (activeHandle === "minimum" && minimum >= maximum) {
+    minimum = Math.max(absoluteMinimum, maximum - 1);
+    elements.frameRateMinimum.value = String(minimum);
+  } else if (activeHandle === "maximum" && maximum <= minimum) {
+    minimum = absoluteMinimum;
+    elements.frameRateMinimum.value = String(minimum);
+  }
+  updateFrameRateLabel(activeHandle);
+  updateEstimate();
 }
 
 function setupFramelessWindow() {
@@ -324,10 +383,13 @@ function bindEvents() {
     updateFormState();
   });
   elements.audioBitrate.addEventListener("change", updateEstimate);
-  elements.frameRate.addEventListener("input", () => {
-    updateFrameRateLabel();
-    updateEstimate();
-  });
+  elements.autoResolution.addEventListener("change", updateFormState);
+  elements.frameRateMinimum.addEventListener("input", () => handleFrameRateInput("minimum"));
+  elements.frameRateMaximum.addEventListener("input", () => handleFrameRateInput("maximum"));
+  for (const control of [elements.frameRateMinimum, elements.frameRateMaximum]) {
+    control.addEventListener("change", () => updateFrameRateLabel());
+    control.addEventListener("blur", () => updateFrameRateLabel());
+  }
   elements.sizePresets.addEventListener("click", (event) => {
     const button = event.target.closest("button");
     if (!button || state.encoding) return;
@@ -638,7 +700,9 @@ async function startCompression() {
         audioChannels: elements.audioChannels.value,
         twoPass: elements.twoPass.checked,
         resolutionHeight: Number(elements.resolution.value || 0),
+        autoResolution: elements.autoResolution.checked,
         outputFps: requestedOutputFPS(),
+        minimumOutputFps: requestedMinimumOutputFPS(),
       }),
     });
     pollJob();
@@ -687,7 +751,9 @@ function renderJob(job) {
   elements.progressTrack.setAttribute("aria-valuenow", String(Math.round(progress)));
   elements.progressEyeline.textContent = statusEyeline(job);
   elements.progressHeading.textContent = job.phase || "Compression progress";
-  elements.progressPass.textContent = stageLabel(job);
+  const metric = progressMetric(job);
+  elements.progressPassLabel.textContent = metric.label;
+  elements.progressPass.textContent = metric.value;
   elements.progressSize.textContent = formatBytes(job.encodedBytes || 0);
   elements.progressElapsed.textContent = formatDuration(job.elapsedSeconds || 0);
   elements.progressRemainingStat.hidden = job.state !== "running";
@@ -725,6 +791,18 @@ function stageLabel(job) {
   if (job.phase === "Verifying") return "Size check";
   if (job.passes > 1 && job.pass) return `Pass ${job.pass} of ${job.passes}`;
   return job.phase || "Preparing";
+}
+
+function progressMetric(job) {
+  if (job.state === "running" && String(job.phase || "").startsWith("Encoding")) {
+    const details = [];
+    const bitrate = Number(job.videoBitrateKbps || 0);
+    const fps = Number(job.outputFps || 0);
+    if (bitrate > 0) details.push(formatBitrate(bitrate));
+    if (fps > 0) details.push(`${trimNumber(fps, 2)} fps`);
+    return { label: "Video", value: details.join(" · ") || "Starting" };
+  }
+  return { label: "Stage", value: stageLabel(job) };
 }
 
 function setEncodingState(encoding) {
@@ -809,8 +887,11 @@ function updateEstimate() {
     elements.bitrateEstimate.textContent = "Target is too small for this duration";
     return;
   }
-  const outputFPS = requestedOutputFPS();
-  const frameRateSummary = outputFPS ? ` · Output: ${trimNumber(outputFPS, 2)} fps` : "";
+  const maximumFPS = requestedOutputFPS() || Number(state.input.fps || 0);
+  const minimumFPS = requestedMinimumOutputFPS();
+  const frameRateSummary = minimumFPS
+    ? ` · FPS: ${trimNumber(minimumFPS, 2)}–${trimNumber(maximumFPS, 2)}`
+    : ` · FPS: ${trimNumber(maximumFPS, 2)} fixed`;
   elements.bitrateEstimate.textContent = `Estimated video bitrate: ${formatBitrate(videoKbps)}${tracks ? ` · Audio: ${audioKbps} kbps total` : " · No audio"}${frameRateSummary}`;
 }
 

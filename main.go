@@ -25,11 +25,11 @@ import (
 	"time"
 )
 
-const version = "1.8.12"
+const version = "1.8.18"
 
 const (
 	minimumWindowWidth   = 1040
-	minimumWindowHeight  = 660
+	minimumWindowHeight  = 700
 	browserProfilePrefix = "exactsize-browser-"
 	browserProfileOwner  = ".exactsize-owner-pid"
 )

@@ -8,6 +8,12 @@ import (
 	"time"
 )
 
+func TestMinimumWindowHeightFitsIndependentResolutionToggle(t *testing.T) {
+	if minimumWindowHeight < 700 {
+		t.Fatalf("minimum window height %d can reintroduce a vertical scrollbar", minimumWindowHeight)
+	}
+}
+
 func TestBrowserProfileCleanup(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
