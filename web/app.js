@@ -80,6 +80,7 @@ const state = {
   encoding: false,
   pollingTimer: null,
   toastTimer: null,
+  notifiedCorrectionAttempt: 0,
 };
 
 const containerCodecs = {
@@ -674,6 +675,7 @@ async function startCompression() {
   if (state.encoding || !isFormValid()) return;
   const output = ensureExtension(elements.outputPath.value.trim(), extensions[elements.container.value]);
   elements.outputPath.value = output;
+  state.notifiedCorrectionAttempt = 0;
   clearError();
   renderJob({
     state: "queued",
@@ -733,7 +735,7 @@ async function pollJob() {
 async function cancelCompression() {
   if (!state.encoding) return;
   elements.cancelButton.disabled = true;
-  elements.progressMessage.textContent = "Stopping FFmpeg and cleaning temporary files…";
+  showToast("Stopping FFmpeg and cleaning temporary files…");
   try {
     await api("/api/jobs/current", { method: "DELETE" });
   } catch (error) {
@@ -758,8 +760,11 @@ function renderJob(job) {
   elements.progressElapsed.textContent = formatDuration(job.elapsedSeconds || 0);
   elements.progressRemainingStat.hidden = job.state !== "running";
   elements.progressRemaining.textContent = job.remainingSeconds > 0 ? formatDuration(job.remainingSeconds) : "—";
-  elements.progressMessage.textContent = job.message || "Working…";
-  elements.progressMessage.title = job.message || "";
+  const active = ["queued", "running"].includes(job.state);
+  elements.progressMessage.hidden = active;
+  elements.progressMessage.textContent = active ? "" : (job.message || "");
+  elements.progressMessage.title = active ? "" : (job.message || "");
+  notifyCorrection(job);
   elements.cancelButton.hidden = !["queued", "running"].includes(job.state);
   elements.cancelButton.disabled = job.state !== "running";
   elements.showOutputButton.hidden = job.state !== "completed";
@@ -772,6 +777,15 @@ function renderJob(job) {
   if (job.state === "failed") setRuntime("Compression failed", "error");
   else if (job.state === "completed") setRuntime("Complete", "ready");
   else if (job.state === "canceled") setRuntime("Canceled", "ready");
+}
+
+function notifyCorrection(job) {
+  const attempt = Number(job.attempt || 0);
+  const message = String(job.message || "").trim();
+  const encoding = job.state === "running" && String(job.phase || "").startsWith("Encoding");
+  if (!encoding || attempt <= 1 || attempt <= state.notifiedCorrectionAttempt || !message) return;
+  state.notifiedCorrectionAttempt = attempt;
+  showToast(message);
 }
 
 function statusEyeline(job) {
@@ -1041,6 +1055,7 @@ function showError(error) {
   elements.progressPanel.classList.add("failed");
   elements.progressEyeline.textContent = "Needs attention";
   elements.progressHeading.textContent = "Unable to continue";
+  elements.progressMessage.hidden = false;
   elements.progressMessage.textContent = "Check the error, adjust the settings, and try again.";
 }
 

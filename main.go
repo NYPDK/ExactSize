@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-const version = "1.8.18"
+const version = "1.8.20"
 
 const (
 	minimumWindowWidth   = 1040

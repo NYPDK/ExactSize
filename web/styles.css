@@ -667,6 +667,13 @@ select {
   border: 0;
 }
 
+/* Encoding disables the range inputs to lock their values. Keep the custom
+   handles fully visible; unavailable frame-rate controls are still dimmed by
+   their parent row. */
+.frame-rate-range:disabled {
+  opacity: 1;
+}
+
 .frame-rate-range::-webkit-slider-runnable-track {
   height: 4px;
   background: transparent;

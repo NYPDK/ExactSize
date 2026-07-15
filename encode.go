@@ -245,11 +245,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	previousOutputFPS := -1.0
 	adaptiveFPSStage := 0
 	maximumAttempts := correctionAttemptLimit(j.request, info, autoResolution)
-	attemptMessage := fmt.Sprintf(
-		"Starting at %d kbps and %s fps; bitrate corrections run before lower frame rates or resolutions.",
-		videoKbps,
-		formatFrameRate(initialOutputFPS),
-	)
+	attemptMessage := ""
 
 	for attempt := 1; attempt <= maximumAttempts; attempt++ {
 		if err := j.ctx.Err(); err != nil {

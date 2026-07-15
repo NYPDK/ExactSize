@@ -31,6 +31,17 @@ func TestFrameRateRangeUsesTwoWholeNumberHandles(t *testing.T) {
 	}
 }
 
+func TestDisabledFrameRateHandlesStayOpaque(t *testing.T) {
+	css, err := webAssets.ReadFile("web/styles.css")
+	if err != nil {
+		t.Fatal(err)
+	}
+	styles := string(css)
+	if !strings.Contains(styles, ".frame-rate-range:disabled {\n  opacity: 1;\n}") {
+		t.Fatal("disabled FPS handles must remain opaque while encoding locks the sliders")
+	}
+}
+
 func TestStartingResolutionAndAutomaticFallbackAreSeparateControls(t *testing.T) {
 	html, err := webAssets.ReadFile("web/index.html")
 	if err != nil {
@@ -67,7 +78,16 @@ func TestProgressPanelDoesNotRepeatEncoding(t *testing.T) {
 		t.Fatal(err)
 	}
 	script := string(javascript)
-	for _, behavior := range []string{"function progressMetric(job)", `label: "Video"`, `details.push(formatBitrate(bitrate))`, "details.push(`${trimNumber(fps, 2)} fps`)"} {
+	for _, behavior := range []string{
+		"function progressMetric(job)",
+		`label: "Video"`,
+		`details.push(formatBitrate(bitrate))`,
+		"details.push(`${trimNumber(fps, 2)} fps`)",
+		"function notifyCorrection(job)",
+		"attempt <= 1",
+		"showToast(message)",
+		`elements.progressMessage.hidden = active`,
+	} {
 		if !strings.Contains(script, behavior) {
 			t.Fatalf("progress panel is missing %q", behavior)
 		}
