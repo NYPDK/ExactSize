@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
@@ -35,6 +38,8 @@ type App struct {
 	shutdown func()
 	uploads  []string
 }
+
+const comparePreviewPrefix = "exactsize-compare-"
 
 type AppStatus struct {
 	Version          string        `json:"version"`
@@ -132,6 +137,7 @@ type dialogResponse struct {
 }
 
 func newApp(ffmpeg, ffprobe, token string, web fs.FS) *App {
+	cleanupStaleComparePreviews()
 	return &App{ffmpeg: ffmpeg, ffprobe: ffprobe, token: token, web: web}
 }
 
@@ -150,6 +156,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/jobs", a.auth(a.handleStartJob))
 	mux.HandleFunc("GET /api/jobs/current", a.auth(a.handleCurrentJob))
 	mux.HandleFunc("DELETE /api/jobs/current", a.auth(a.handleCancelJob))
+	mux.HandleFunc("GET /api/compare/frame/{side}", a.auth(a.handleCompareFrame))
 	mux.HandleFunc("POST /api/reveal", a.auth(a.handleReveal))
 	mux.HandleFunc("POST /api/window/{action}", a.auth(a.handleWindowAction))
 	mux.HandleFunc("POST /api/quit", a.auth(a.handleQuit))
@@ -165,7 +172,7 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; media-src 'self'; connect-src 'self'; font-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 		next.ServeHTTP(w, r)
 	})
 }
@@ -362,6 +369,92 @@ func (a *App) handleCurrentJob(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, job.snapshot())
 }
 
+func (a *App) currentComparisonJob() (*Job, int, string) {
+	a.mu.RLock()
+	job := a.job
+	a.mu.RUnlock()
+	if job == nil {
+		return nil, http.StatusNotFound, "no completed compression is available to compare"
+	}
+	snapshot := job.snapshot()
+	if snapshot.State != "completed" || job.request.Remux || job.request.MuxAudio {
+		return nil, http.StatusConflict, "comparison is available only after a successful compression"
+	}
+	return job, 0, ""
+}
+
+// handleCompareFrame supplies the matched stills used by timeline hover
+// scrubbing. Extracting only the requested timestamp avoids browser codec
+// limits, full preview encodes, and comparison files in /tmp.
+func (a *App) handleCompareFrame(w http.ResponseWriter, r *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+
+	seconds, err := strconv.ParseFloat(r.URL.Query().Get("time"), 64)
+	if err != nil || seconds < 0 || seconds > 24*60*60 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+		writeError(w, http.StatusBadRequest, "comparison time must be between 0 and 24 hours")
+		return
+	}
+	var path string
+	switch r.PathValue("side") {
+	case "input":
+		path = job.request.Input
+	case "output":
+		path = job.request.Output
+	default:
+		writeError(w, http.StatusNotFound, "unknown comparison side")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	frame, err := a.extractCompareFrame(ctx, path, seconds)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			writeError(w, http.StatusGatewayTimeout, "comparison frame extraction timed out")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Content-Length", strconv.Itoa(len(frame)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(frame)
+}
+
+func (a *App) extractCompareFrame(ctx context.Context, source string, seconds float64) ([]byte, error) {
+	filter := "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,format=rgb24"
+	args := []string{
+		"-hide_banner", "-nostdin", "-loglevel", "error",
+		"-ss", strconv.FormatFloat(seconds, 'f', 3, 64),
+		"-i", source,
+		"-map", "0:v:0", "-frames:v", "1", "-an", "-sn", "-dn",
+		"-vf", filter, "-c:v", "png", "-compression_level", "3",
+		"-f", "image2pipe", "pipe:1",
+	}
+	var output bytes.Buffer
+	var stderr bytes.Buffer
+	command := exec.CommandContext(ctx, a.ffmpeg, args...)
+	command.Stdout = &output
+	command.Stderr = &stderr
+	err := command.Run()
+	if err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		return nil, errors.New(detail)
+	}
+	if output.Len() == 0 {
+		return nil, errors.New("FFmpeg returned an empty comparison frame")
+	}
+	return output.Bytes(), nil
+}
+
 func (a *App) handleCancelJob(w http.ResponseWriter, _ *http.Request) {
 	a.mu.RLock()
 	job := a.job
@@ -375,14 +468,34 @@ func (a *App) handleCancelJob(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (a *App) cancelCurrentJob() {
-	a.mu.RLock()
+	a.mu.Lock()
 	job := a.job
-	a.mu.RUnlock()
+	uploads := append([]string(nil), a.uploads...)
+	a.uploads = nil
+	a.mu.Unlock()
 	if job != nil && !job.isTerminal() {
 		job.cancel()
 	}
-	for _, path := range a.uploads {
+	for _, path := range uploads {
 		_ = os.Remove(path)
+	}
+}
+
+func cleanupStaleComparePreviews() {
+	directories, _ := filepath.Glob(filepath.Join(os.TempDir(), comparePreviewPrefix+"*"))
+	for _, dir := range directories {
+		name := strings.TrimPrefix(filepath.Base(dir), comparePreviewPrefix)
+		pidText, _, found := strings.Cut(name, "-")
+		if pid, err := strconv.Atoi(pidText); found && err == nil {
+			if processIsRunning(pid) {
+				continue
+			}
+			_ = os.RemoveAll(dir)
+			continue
+		}
+		if info, err := os.Stat(dir); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
+			_ = os.RemoveAll(dir)
+		}
 	}
 }
 

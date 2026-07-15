@@ -270,6 +270,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>
             Cancel
           </button>
+          <button class="secondary-button" id="compareButton" type="button" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M8 7l-4 5 4 5M16 7l4 5-4 5"/></svg>
+            Compare
+          </button>
           <button class="secondary-button" id="showOutputButton" type="button" hidden>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3V7z"/></svg>
             Show output
@@ -277,6 +281,44 @@
         </div>
       </section>
     </main>
+  </div>
+
+  <div class="compare-overlay" id="compareOverlay" hidden>
+    <section class="compare-dialog" role="dialog" aria-modal="true" aria-labelledby="compareTitle" aria-describedby="compareHint">
+      <header class="compare-header">
+        <div>
+          <span class="eyeline">Visual comparison</span>
+          <h2 id="compareTitle">Original vs compressed</h2>
+        </div>
+        <button class="icon-button" id="compareClose" type="button" aria-label="Close comparison" title="Close comparison">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+
+      <div class="compare-stage" id="compareStage">
+        <img class="compare-frame compare-original" id="compareOriginalFrame" alt="" hidden>
+        <img class="compare-frame compare-compressed" id="compareCompressedFrame" alt="" hidden>
+        <span class="compare-label compare-label-original">Original</span>
+        <span class="compare-label compare-label-compressed">Compressed</span>
+        <span class="compare-divider" aria-hidden="true"></span>
+        <input class="compare-split-control" id="compareSlider" type="range" min="0" max="100" step="1" value="50" aria-label="Comparison divider position">
+        <span class="compare-loading" id="compareLoading" role="status">Loading video previews…</span>
+      </div>
+
+      <footer class="compare-controls" id="compareControls">
+        <div class="compare-timeline-wrap" id="compareTimelineWrap">
+          <div class="compare-hover-preview" id="compareHoverPreview" aria-hidden="true" hidden>
+            <div class="compare-hover-stage" id="compareHoverStage">
+              <img class="compare-hover-frame" id="compareHoverFrame" alt="Compressed frame preview">
+            </div>
+            <output class="compare-hover-time" id="compareHoverTime">00:00</output>
+          </div>
+          <input class="compare-timeline" id="compareTimeline" type="range" min="0" max="1000" step="1" value="0" aria-label="Comparison frame time" disabled>
+        </div>
+        <output class="compare-time" id="compareTime" for="compareTimeline">00:00 / 00:00</output>
+        <span class="compare-hint" id="compareHint">Hover for a preview · click or drag to inspect that frame.</span>
+      </footer>
+    </section>
   </div>
 
   <div class="confirm-overlay" id="confirmOverlay" hidden>

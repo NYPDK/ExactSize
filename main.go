@@ -25,7 +25,11 @@ import (
 	"time"
 )
 
-const version = "1.8.21"
+const version = "1.8.29"
+
+var errAlreadyRunning = errors.New("ExactSize is already running")
+
+const alreadyRunningMessage = "ExactSize is already running. Close the existing window before opening another one."
 
 const (
 	minimumWindowWidth   = 1040
@@ -42,6 +46,12 @@ var iconPNG []byte
 
 func main() {
 	if err := run(); err != nil {
+		if errors.Is(err, errAlreadyRunning) {
+			if runtime.GOOS == "linux" && os.Getenv("EXACTSIZE_HEADLESS") != "1" {
+				showWarningDialog(alreadyRunningMessage)
+			}
+			return
+		}
 		log.Printf("ExactSize: %v", err)
 		if runtime.GOOS == "linux" {
 			showFatalDialog(err.Error())
@@ -51,6 +61,12 @@ func main() {
 }
 
 func run() error {
+	instanceGuard, err := acquireInstanceGuard(instanceGuardAddress())
+	if err != nil {
+		return err
+	}
+	defer instanceGuard.Close()
+
 	ffmpeg, err := locateTool("EXACTSIZE_FFMPEG", "ffmpeg")
 	if err != nil {
 		return fmt.Errorf("FFmpeg was not found: %w", err)
@@ -122,6 +138,28 @@ func run() error {
 	app.cancelCurrentJob()
 	_ = server.Shutdown(shutdownCtx)
 	return nil
+}
+
+// acquireInstanceGuard uses Linux's abstract Unix-socket namespace, so the
+// guard is released by the kernel when ExactSize exits and never leaves a lock
+// file behind. Scoping the name by user allows independent desktop sessions.
+func instanceGuardAddress() string {
+	return "\x00io.exactsize.ExactSize-" + strconv.Itoa(os.Getuid())
+}
+
+func acquireInstanceGuard(name string) (*net.UnixListener, error) {
+	address := &net.UnixAddr{
+		Name: name,
+		Net:  "unix",
+	}
+	listener, err := net.ListenUnix("unix", address)
+	if err != nil {
+		if errors.Is(err, syscall.EADDRINUSE) {
+			return nil, errAlreadyRunning
+		}
+		return nil, fmt.Errorf("create single-instance guard: %w", err)
+	}
+	return listener, nil
 }
 
 func locateTool(envName, name string) (string, error) {
@@ -301,10 +339,8 @@ func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
 }
 
 // integrateAppImage installs a launcher entry and icons under ~/.local/share
-// when running from an AppImage, so menus, the task manager, and search show
-// the app icon. File managers need an AppImage thumbnailer to preview the
-// file itself, which not every distribution ships. The entry is rewritten
-// whenever the AppImage path or version changes.
+// when running from an AppImage. Launchers always point at a stable symlink
+// which is atomically retargeted to the exact AppImage currently running.
 func integrateAppImage() {
 	appimage := strings.TrimSpace(os.Getenv("APPIMAGE"))
 	if appimage == "" || runtime.GOOS != "linux" {
@@ -314,41 +350,53 @@ func integrateAppImage() {
 	if err != nil {
 		return
 	}
+	_ = installAppImageIntegration(appimage, home)
+}
+
+func installAppImageIntegration(appimage, home string) error {
+	resolvedAppImage, err := filepath.EvalSymlinks(appimage)
+	if err != nil {
+		return fmt.Errorf("resolve AppImage path: %w", err)
+	}
+	resolvedAppImage, err = filepath.Abs(resolvedAppImage)
+	if err != nil {
+		return fmt.Errorf("make AppImage path absolute: %w", err)
+	}
+	if !fileExists(resolvedAppImage) {
+		return fmt.Errorf("AppImage is not a regular file: %s", resolvedAppImage)
+	}
+
 	share := filepath.Join(home, ".local", "share")
 	pngPath := filepath.Join(share, "icons", "hicolor", "256x256", "apps", "exactsize.png")
 	svgPath := filepath.Join(share, "icons", "hicolor", "scalable", "apps", "exactsize.svg")
 	desktopPath := filepath.Join(share, "applications", "io.exactsize.ExactSize.desktop")
-	for _, dir := range []string{filepath.Dir(pngPath), filepath.Dir(svgPath), filepath.Dir(desktopPath)} {
+	link := filepath.Join(share, "exactsize", "ExactSize.AppImage")
+	for _, dir := range []string{filepath.Dir(pngPath), filepath.Dir(svgPath), filepath.Dir(desktopPath), filepath.Dir(link)} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return
+			return err
 		}
 	}
-	_ = os.WriteFile(pngPath, iconPNG, 0o644)
+	if err := os.WriteFile(pngPath, iconPNG, 0o644); err != nil {
+		return err
+	}
 	if svg, err := fs.ReadFile(webAssets, "web/icon.svg"); err == nil {
-		_ = os.WriteFile(svgPath, svg, 0o644)
+		if err := os.WriteFile(svgPath, svg, 0o644); err != nil {
+			return err
+		}
 	}
 
-	// The AppImage file name carries the version, which would break launcher
-	// pins on every update. Point Exec at something stable instead: the
-	// AppDir's AppRun when running from a source build, otherwise a symlink
-	// that each launch retargets at the current AppImage.
-	execTarget := appimage
-	if appRun := filepath.Join(filepath.Dir(appimage), "ExactSize.AppDir", "AppRun"); fileExists(appRun) {
-		execTarget = appRun
-	} else {
-		link := filepath.Join(share, "exactsize", "ExactSize.AppImage")
-		if err := os.MkdirAll(filepath.Dir(link), 0o755); err == nil {
-			temporary := link + ".new"
-			if os.Symlink(appimage, temporary) == nil && os.Rename(temporary, link) == nil {
-				execTarget = link
-			} else {
-				_ = os.Remove(temporary)
-			}
-		}
+	temporaryLink := fmt.Sprintf("%s.new-%d", link, os.Getpid())
+	_ = os.Remove(temporaryLink)
+	if err := os.Symlink(resolvedAppImage, temporaryLink); err != nil {
+		return fmt.Errorf("create current AppImage link: %w", err)
+	}
+	if err := os.Rename(temporaryLink, link); err != nil {
+		_ = os.Remove(temporaryLink)
+		return fmt.Errorf("activate current AppImage link: %w", err)
 	}
 
 	// Exec quoting per the desktop entry spec.
-	quoted := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`).Replace(execTarget)
+	quoted := strings.NewReplacer(`\`, `\\`, `"`, `\"`, `%`, `%%`).Replace(link)
 	desktop := fmt.Sprintf(`[Desktop Entry]
 Type=Application
 Name=ExactSize
@@ -363,10 +411,44 @@ StartupNotify=true
 StartupWMClass=ExactSize
 X-AppImage-Version=%s
 `, quoted, version)
-	if existing, err := os.ReadFile(desktopPath); err == nil && string(existing) == desktop {
-		return
+	if err := writeFileIfChanged(desktopPath, []byte(desktop), 0o644); err != nil {
+		return err
 	}
-	_ = os.WriteFile(desktopPath, []byte(desktop), 0o644)
+
+	// Keep an existing desktop shortcut in sync too. We deliberately do not
+	// create one: only shortcuts already identified as ExactSize are updated.
+	desktopDir := xdgUserDir("DESKTOP", home)
+	if desktopDir == "" {
+		desktopDir = filepath.Join(home, "Desktop")
+	}
+	entries, _ := os.ReadDir(desktopDir)
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.EqualFold(filepath.Ext(entry.Name()), ".desktop") {
+			continue
+		}
+		path := filepath.Join(desktopDir, entry.Name())
+		existing, err := os.ReadFile(path)
+		if err != nil || !isExactSizeDesktopEntry(existing) {
+			continue
+		}
+		if err := writeFileIfChanged(path, []byte(desktop), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isExactSizeDesktopEntry(data []byte) bool {
+	entry := string(data)
+	return strings.Contains(entry, "[Desktop Entry]") &&
+		(strings.Contains(entry, "StartupWMClass=ExactSize") || strings.Contains(entry, "Name=ExactSize\n"))
+}
+
+func writeFileIfChanged(path string, data []byte, mode fs.FileMode) error {
+	if existing, err := os.ReadFile(path); err == nil && string(existing) == string(data) {
+		return nil
+	}
+	return os.WriteFile(path, data, mode)
 }
 
 // exactSizeClassPattern matches the app window class: "ExactSize" under X11
@@ -526,5 +608,19 @@ func showFatalDialog(message string) {
 	}
 	if path, err := exec.LookPath("zenity"); err == nil {
 		_ = exec.Command(path, "--error", "--title=ExactSize", "--text="+message).Run()
+	}
+}
+
+func showWarningDialog(message string) {
+	if path, err := exec.LookPath("kdialog"); err == nil {
+		_ = exec.Command(path, "--sorry", message, "--title", "ExactSize").Run()
+		return
+	}
+	if path, err := exec.LookPath("zenity"); err == nil {
+		_ = exec.Command(path, "--warning", "--title=ExactSize", "--text="+message).Run()
+		return
+	}
+	if path, err := exec.LookPath("xmessage"); err == nil {
+		_ = exec.Command(path, "-center", "-title", "ExactSize", message).Run()
 	}
 }
