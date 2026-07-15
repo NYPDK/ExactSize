@@ -1,0 +1,17 @@
+# Build artifacts
+/build/
+/exactsize
+*.AppImage
+
+# Test data and outputs
+/testdata/
+coverage.out
+*.prof
+
+# Logs and OS/editor noise
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
+.gitignore

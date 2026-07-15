@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ExactSize
+GenericName=Video size compressor
+Comment=Compress videos to a strict maximum file size
+Exec=exactsize
+Icon=exactsize
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=video;compress;encode;ffmpeg;av1;h264;h265;vp9;
+StartupNotify=true
+StartupWMClass=ExactSize

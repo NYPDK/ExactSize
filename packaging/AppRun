@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export EXACTSIZE_FFMPEG="$APPDIR/usr/bin/ffmpeg"
+export EXACTSIZE_FFPROBE="$APPDIR/usr/bin/ffprobe"
+
+exec "$APPDIR/usr/bin/exactsize" "$@"

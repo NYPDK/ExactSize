@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.exactsize.ExactSize</id>
+  <name>ExactSize</name>
+  <summary>Compress videos to a strict maximum file size</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      ExactSize calculates a bitrate budget from the video duration, selected audio settings,
+      and container overhead. It verifies the completed file and automatically corrects any
+      overshoot before publishing the output.
+    </p>
+  </description>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Video</category>
+  </categories>
+  <url type="homepage">https://github.com/NYPDK/ExactSize</url>
+  <developer id="com.github.nypdk">
+    <name>NYPDK</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <launchable type="desktop-id">exactsize.desktop</launchable>
+  <releases>
+    <release version="1.8.5" date="2026-07-14"/>
+    <release version="1.8.4" date="2026-07-14"/>
+    <release version="1.8.3" date="2026-07-14"/>
+    <release version="1.8.2" date="2026-07-14"/>
+    <release version="1.8.1" date="2026-07-14"/>
+    <release version="1.8.0" date="2026-07-14"/>
+    <release version="1.7.1" date="2026-07-14"/>
+    <release version="1.7.0" date="2026-07-14"/>
+    <release version="1.6.2" date="2026-07-14"/>
+    <release version="1.6.1" date="2026-07-14"/>
+    <release version="1.6.0" date="2026-07-14"/>
+    <release version="1.5.1" date="2026-07-14"/>
+    <release version="1.5.0" date="2026-07-14"/>
+    <release version="1.4.2" date="2026-07-14"/>
+    <release version="1.4.1" date="2026-07-14"/>
+    <release version="1.4.0" date="2026-07-14"/>
+    <release version="1.3.3" date="2026-07-14"/>
+    <release version="1.3.2" date="2026-07-14"/>
+    <release version="1.3.1" date="2026-07-14"/>
+    <release version="1.3.0" date="2026-07-14"/>
+    <release version="1.2.0" date="2026-07-14"/>
+    <release version="1.1.2" date="2026-07-14"/>
+    <release version="1.1.1" date="2026-07-14"/>
+    <release version="1.1.0" date="2026-07-14"/>
+    <release version="1.0.1" date="2026-07-14"/>
+    <release version="1.0.0" date="2026-07-14"/>
+  </releases>
+</component>
