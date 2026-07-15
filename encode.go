@@ -19,7 +19,7 @@ import (
 
 const (
 	minimumVideoBitrateKbps = 64
-	maximumEncodeAttempts   = 6
+	maximumEncodeAttempts   = 8
 )
 
 var minimumAudioBitrateKbps = map[string]int{
@@ -325,8 +325,9 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			// Hardware encoders miss low targets additively: driver quality
 			// floors (keyframes especially) add a roughly constant bitrate on
 			// top of the request. Subtracting the measured excess converges
-			// in one correction where a ratio cut needs several; only when
-			// the excess eats most of the budget is the resolution hopeless.
+			// in one correction where a ratio cut needs several. When the
+			// excess eats most of the budget, exhaust the minimum bitrate
+			// before allowing Auto resolution to step down.
 			correctionBudgetKbps := originalKbps
 			if availableVideoKbps > 0 {
 				correctionBudgetKbps = hardwareSafeBitrate(availableVideoKbps)
@@ -336,6 +337,13 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 				hopeless = true
 			}
 			if hopeless {
+				if minimumKbps, ok := minimumBitrateRetry(videoKbps); ok {
+					videoKbps = minimumKbps
+					j.set(func(status *JobSnapshot) {
+						status.Message = "Trying the minimum video bitrate before reducing resolution…"
+					})
+					continue
+				}
 				if !autoResolution {
 					return errors.New("the GPU encoder cannot reach this target at the selected resolution; lower the resolution, switch to a software encoder, or raise the target")
 				}
@@ -851,8 +859,8 @@ func proportionalVideoCorrection(requestedKbps, actualKbps, budgetKbps int) int 
 
 // likelyAV1VAAPIBitrateFloor recognizes the severe low-bits-per-pixel miss
 // seen when AV1 VAAPI reaches its quantizer floor. A normal correction cannot
-// reclaim this much bitrate, so Auto resolution should downscale immediately
-// instead of spending another full encode proving the same floor.
+// reclaim this much bitrate, so the correction path should try the minimum
+// bitrate next and only then allow Auto resolution to downscale.
 func likelyAV1VAAPIBitrateFloor(request EncodeRequest, info VideoInfo, requestedKbps, actualKbps, budgetKbps int) bool {
 	if request.Encoder != "av1_vaapi" || requestedKbps <= 0 || actualKbps <= budgetKbps {
 		return false
@@ -872,12 +880,23 @@ func likelyAV1VAAPIBitrateFloor(request EncodeRequest, info VideoInfo, requested
 	return bitsPerPixelFrame <= 0.012
 }
 
+// minimumBitrateRetry exhausts the current resolution's bitrate option before
+// a hardware encode is allowed to downscale. Once the minimum has already
+// failed, the caller can safely proceed to the resolution fallback.
+func minimumBitrateRetry(requestedKbps int) (int, bool) {
+	if requestedKbps <= minimumVideoBitrateKbps {
+		return 0, false
+	}
+	return minimumVideoBitrateKbps, true
+}
+
 // hardwareCorrection turns an oversized hardware attempt into the next move.
 // It returns a corrected bitrate request (measured excess subtracted with a
 // 15% margin, since the excess grows slightly as requests shrink), or
-// hopeless=true when the excess consumes over 60% of the budget and a lower
-// resolution is the only way forward. Both zero values mean the overshoot was
-// not additive; the caller falls back to proportional correction.
+// hopeless=true when the excess consumes over 60% of the budget and an
+// ordinary correction is no longer useful. The caller then tries the minimum
+// bitrate before considering a lower resolution. Both zero values mean the
+// overshoot was not additive; the caller falls back to proportional correction.
 func hardwareCorrection(budgetKbps, requestedKbps, actualKbps int) (int, bool) {
 	excess := actualKbps - requestedKbps
 	if excess <= 0 {

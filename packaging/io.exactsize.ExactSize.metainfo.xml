@@ -23,6 +23,8 @@
   <content_rating type="oars-1.1"/>
   <launchable type="desktop-id">exactsize.desktop</launchable>
   <releases>
+    <release version="1.8.7" date="2026-07-14"/>
+    <release version="1.8.6" date="2026-07-14"/>
     <release version="1.8.5" date="2026-07-14"/>
     <release version="1.8.4" date="2026-07-14"/>
     <release version="1.8.3" date="2026-07-14"/>

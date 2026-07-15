@@ -275,7 +275,7 @@ func TestLikelyAV1VAAPIBitrateFloor(t *testing.T) {
 	request := EncodeRequest{Encoder: "av1_vaapi", VideoCodec: "av1"}
 	info := VideoInfo{Width: 1920, Height: 1080, FPS: 60}
 	if !likelyAV1VAAPIBitrateFloor(request, info, 409, 574, 473) {
-		t.Fatal("the measured 1080p60 AV1 VAAPI floor should downscale immediately")
+		t.Fatal("the measured 1080p60 AV1 VAAPI floor should trigger the minimum-bitrate path")
 	}
 	if likelyAV1VAAPIBitrateFloor(request, info, 409, 520, 473) {
 		t.Fatal("ordinary rate-control drift should get one bitrate correction")
@@ -287,6 +287,15 @@ func TestLikelyAV1VAAPIBitrateFloor(t *testing.T) {
 	request.Encoder = "av1_vaapi"
 	if likelyAV1VAAPIBitrateFloor(request, info, 2000, 2800, 2200) {
 		t.Fatal("a healthy bits-per-pixel budget should not be classified as the low-rate floor")
+	}
+}
+
+func TestMinimumBitrateRetryBeforeDownscale(t *testing.T) {
+	if bitrate, ok := minimumBitrateRetry(409); !ok || bitrate != minimumVideoBitrateKbps {
+		t.Fatalf("a hopeless 409 kbps encode should retry at the minimum, got %d, %v", bitrate, ok)
+	}
+	if bitrate, ok := minimumBitrateRetry(minimumVideoBitrateKbps); ok || bitrate != 0 {
+		t.Fatalf("the minimum bitrate must be exhausted before downscaling, got %d, %v", bitrate, ok)
 	}
 }
 
