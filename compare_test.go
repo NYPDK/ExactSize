@@ -311,3 +311,46 @@ func TestTeardownCompareAssetsRemovesDirAndStopsWork(t *testing.T) {
 		t.Fatal("teardown must clear App.compare")
 	}
 }
+
+func TestPrepareCompareAssetsSkipsSupersededJob(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	app := newApp(fakeCompareFFmpeg(t, dir), "", "secret", nil)
+	current := completedCompareJob(t, dir)
+	app.job = current
+	superseded := completedCompareJob(t, dir)
+
+	app.prepareCompareAssets(superseded)
+
+	app.mu.RLock()
+	compare := app.compare
+	app.mu.RUnlock()
+	if compare != nil {
+		t.Fatalf("prepareCompareAssets must no-op for a job that is no longer current, got %+v", compare)
+	}
+}
+
+func TestEnsureCompareAssetsTearsDownStaleJob(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	app := newApp(fakeCompareFFmpeg(t, dir), "", "secret", nil)
+	oldJob := completedCompareJob(t, dir)
+	newJob := completedCompareJob(t, dir)
+
+	oldAssets := app.ensureCompareAssets(oldJob)
+	oldDir, err := oldAssets.ensureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	freshAssets := app.ensureCompareAssets(newJob)
+	if freshAssets == oldAssets || freshAssets.job != newJob {
+		t.Fatalf("ensureCompareAssets did not install fresh assets for the new job")
+	}
+	if oldAssets.ctx.Err() == nil {
+		t.Fatal("ensureCompareAssets must cancel a stale job's assets")
+	}
+	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
+		t.Fatalf("ensureCompareAssets left the stale job's preview dir behind: %v", err)
+	}
+}

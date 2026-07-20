@@ -298,12 +298,26 @@ type compareAssets struct {
 }
 
 // ensureCompareAssets returns the assets for job, creating them on first use.
-// Callers hold no locks; App.mu guards the App.compare pointer.
+// Callers hold no locks; App.mu guards the App.compare pointer. Assets found
+// for a different job are necessarily stale — most likely a superseded
+// job's own prepareCompareAssets losing a race with a newer job's start —
+// so they are torn down here rather than overwritten in place; otherwise
+// their temp directory and any in-flight FFmpeg render would leak.
 func (a *App) ensureCompareAssets(job *Job) *compareAssets {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.compare != nil && a.compare.job == job {
-		return a.compare
+	if a.compare != nil {
+		if a.compare.job == job {
+			return a.compare
+		}
+		stale := a.compare
+		stale.cancel()
+		stale.mu.Lock()
+		staleDir := stale.dir
+		stale.mu.Unlock()
+		if staleDir != "" {
+			_ = os.RemoveAll(staleDir)
+		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.compare = &compareAssets{
@@ -319,8 +333,17 @@ func (a *App) ensureCompareAssets(job *Job) *compareAssets {
 
 // prepareCompareAssets runs after job.run returns: eligible encodes get their
 // storyboard generated immediately so hover previews are ready before the
-// viewer opens.
+// viewer opens. This runs in its own goroutine and can lose a race with a
+// newer job's start, so it first confirms job is still the current one
+// before creating or touching any assets; a superseded job's prepare is a
+// no-op instead of resurrecting assets a newer job's teardown just cleared.
 func (a *App) prepareCompareAssets(job *Job) {
+	a.mu.RLock()
+	current := a.job
+	a.mu.RUnlock()
+	if current != job {
+		return
+	}
 	snapshot := job.snapshot()
 	if snapshot.State != "completed" || job.request.Remux || job.request.MuxAudio {
 		return
