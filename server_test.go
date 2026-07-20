@@ -107,11 +107,13 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 		`id="compareButton"`,
 		`class="compare-overlay"`,
 		`aria-modal="true"`,
-		`id="compareOriginalFrame"`,
-		`id="compareCompressedFrame"`,
+		`<video class="compare-frame compare-original" id="compareOriginalVideo" muted playsinline preload="auto">`,
+		`<video class="compare-frame compare-compressed" id="compareCompressedVideo" playsinline preload="auto">`,
+		`id="comparePlay"`,
+		`id="compareMute"`,
 		`id="compareSlider" type="range"`,
 		`id="compareHoverPreview"`,
-		`id="compareHoverFrame"`,
+		`id="compareHoverThumb"`,
 		`id="compareHoverTime"`,
 		`id="compareTimeline" type="range"`,
 	} {
@@ -126,24 +128,33 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 	}
 	script := string(javascript)
 	for _, behavior := range []string{
-		"function openCompare()",
+		"async function openCompare()",
 		"function closeCompare()",
+		"function toggleComparePlayback()",
+		"function toggleCompareMute()",
+		"function finishCompareOpen()",
+		"function seekCompare(seconds)",
+		"function startCompareSync()",
+		"function updateCompareClock()",
+		"function chooseCompareSource(side)",
+		"function attachCompareSource(side, variant)",
+		"async function startCompareConvert(side)",
+		"async function pollCompareConvert(side)",
+		"function initCompareStoryboard(manifest)",
+		"function loadCompareStoryboardImage()",
 		"function previewCompareTimeline(event)",
-		"elements.compareTimeline.getBoundingClientRect()",
-		"function scheduleCompareHoverFrame(seconds, delay = 70)",
-		"function loadCompareHoverFrames(seconds)",
-		"function createDecodedCompareHoverURL(seconds, signal)",
-		`fetchCompareFrame("output", seconds, signal)`,
-		"scheduleCompareHoverFrame(seconds, 70)",
-		"elements.compareHoverPreview.hidden = false",
-		"elements.compareHoverPreview.hidden = true",
+		"/api/compare/open",
+		"/api/compare/media/",
+		"/api/compare/convert",
+		"/api/compare/storyboard",
+		"canPlayType",
+		"requestAnimationFrame",
+		".currentTime = master.currentTime",
+		"backgroundPosition",
+		`addEventListener("ended"`,
 		`addEventListener("pointermove", previewCompareTimeline)`,
 		`addEventListener("pointerleave", hideCompareHoverPreview)`,
-		"/api/compare/frame/${side}?time=${seconds.toFixed(3)}",
-		"Loading matched frame at ${formatDuration(seconds)}…",
-		"state.compareFrameAbortController?.abort()",
-		"state.compareHoverAbortController?.abort()",
-		"releaseCompareHoverURLs()",
+		"The compressed output has no audio track",
 		`document.body.classList.add("compare-open")`,
 		`document.body.classList.remove("compare-open")`,
 		`startsWith("Video compressed successfully")`,
@@ -152,43 +163,44 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 			t.Fatalf("comparison behavior is missing %q", behavior)
 		}
 	}
+
+	// The stills-era machinery must be gone: no per-position fetches, no
+	// object URLs, no frame endpoints.
+	for _, removed := range []string{
+		"/api/compare/frame",
+		"fetchCompareFrame",
+		"createDecodedCompareFrameURLs",
+		"createDecodedCompareHoverURL",
+		"loadCompareFrames",
+		"loadCompareHoverFrames",
+		"scheduleCompareFrame",
+		"scheduleCompareHoverFrame",
+		"compareHoverObjectURLs",
+		"compareFrameObjectURLs",
+	} {
+		if strings.Contains(script, removed) {
+			t.Fatalf("stills-era comparison machinery %q must be removed", removed)
+		}
+	}
+	if strings.Contains(markup, `id="compareHoverFrame"`) || strings.Contains(markup, `id="compareOriginalFrame"`) {
+		t.Fatal("the stills-era img elements must be replaced by video elements")
+	}
+
+	// Hover previews are storyboard lookups: the pointermove handler may not
+	// perform network requests.
 	hoverStart := strings.Index(script, "function previewCompareTimeline(event)")
 	if hoverStart < 0 {
 		t.Fatal("could not find the timeline hover handler")
 	}
-	hoverEnd := strings.Index(script[hoverStart:], "\n}\n\nasync function fetchCompareFrame")
+	hoverEnd := strings.Index(script[hoverStart:], "\n}\n")
 	if hoverEnd < 0 {
 		t.Fatal("could not inspect the timeline hover handler")
 	}
 	hoverHandler := script[hoverStart : hoverStart+hoverEnd]
-	for _, mainViewMutation := range []string{"scheduleCompareFrame(", "updateCompareTimelinePosition(", "elements.compareTimeline.value ="} {
-		if strings.Contains(hoverHandler, mainViewMutation) {
-			t.Fatalf("timeline hover must not mutate the main comparison through %q", mainViewMutation)
+	for _, network := range []string{"fetch(", "api(", "await"} {
+		if strings.Contains(hoverHandler, network) {
+			t.Fatalf("timeline hover must stay a local storyboard lookup, found %q", network)
 		}
-	}
-	hoverLoaderStart := strings.Index(script, "async function loadCompareHoverFrames(seconds)")
-	if hoverLoaderStart < 0 {
-		t.Fatal("could not find the hover thumbnail loader")
-	}
-	hoverLoaderEnd := strings.Index(script[hoverLoaderStart:], "\n}\n\nasync function loadCompareFrames")
-	if hoverLoaderEnd < 0 {
-		t.Fatal("could not inspect the hover thumbnail loader")
-	}
-	hoverLoader := script[hoverLoaderStart : hoverLoaderStart+hoverLoaderEnd]
-	if strings.Contains(hoverLoader, "createDecodedCompareFrameURLs") || !strings.Contains(hoverLoader, "createDecodedCompareHoverURL") {
-		t.Fatal("hover thumbnails must use the single compressed-frame decoder")
-	}
-	hoverDecoderStart := strings.Index(script, "async function createDecodedCompareHoverURL(seconds, signal)")
-	if hoverDecoderStart < 0 {
-		t.Fatal("could not find the hover thumbnail decoder")
-	}
-	hoverDecoderEnd := strings.Index(script[hoverDecoderStart:], "\n}\n\nfunction scheduleCompareHoverFrame")
-	if hoverDecoderEnd < 0 {
-		t.Fatal("could not inspect the hover thumbnail decoder")
-	}
-	hoverDecoder := script[hoverDecoderStart : hoverDecoderStart+hoverDecoderEnd]
-	if strings.Contains(hoverDecoder, `fetchCompareFrame("input"`) || !strings.Contains(hoverDecoder, `fetchCompareFrame("output"`) {
-		t.Fatal("hover thumbnails must request only the compressed output")
 	}
 
 	css, err := webAssets.ReadFile("web/styles.css")
@@ -196,11 +208,6 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 		t.Fatal(err)
 	}
 	styles := string(css)
-	for _, playback := range []string{"<video", `id="comparePlay"`, "/api/compare/stream", ".play()"} {
-		if strings.Contains(markup, playback) || strings.Contains(script, playback) {
-			t.Fatalf("still-frame comparison retains playback behavior %q", playback)
-		}
-	}
 	if strings.Contains(markup, "compare-handle") || strings.Contains(styles, ".compare-handle") {
 		t.Fatal("the comparison divider should remain a plain line without a center handle")
 	}
@@ -216,19 +223,16 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 		"grid-template-rows: auto minmax(0, 1fr) auto;",
 		"width: 100%;",
 		"height: 100%;",
-		"grid-template-columns: minmax(120px, 1fr) auto auto;",
+		"grid-template-columns: auto auto minmax(120px, 1fr) auto auto;",
 		".compare-hover-preview {",
 		"width: 192px;",
-		".compare-hover-stage {",
+		".compare-hover-thumb {",
 		".compare-hover-time {",
+		".compare-play.playing .play-icon",
+		".compare-mute.muted .sound-icon",
 	} {
 		if !strings.Contains(styles, layout) {
-			t.Fatalf("large comparison modal is missing %q", layout)
-		}
-	}
-	for _, removedSplitPreview := range []string{`id="compareHoverOriginal"`, `id="compareHoverCompressed"`, "compare-hover-divider"} {
-		if strings.Contains(markup, removedSplitPreview) || strings.Contains(styles, removedSplitPreview) {
-			t.Fatalf("hover preview must contain only the compressed frame, found %q", removedSplitPreview)
+			t.Fatalf("playback comparison modal is missing %q", layout)
 		}
 	}
 }

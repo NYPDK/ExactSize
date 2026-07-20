@@ -296,8 +296,8 @@
       </header>
 
       <div class="compare-stage" id="compareStage">
-        <img class="compare-frame compare-original" id="compareOriginalFrame" alt="" hidden>
-        <img class="compare-frame compare-compressed" id="compareCompressedFrame" alt="" hidden>
+        <video class="compare-frame compare-original" id="compareOriginalVideo" muted playsinline preload="auto"></video>
+        <video class="compare-frame compare-compressed" id="compareCompressedVideo" playsinline preload="auto"></video>
         <span class="compare-label compare-label-original">Original</span>
         <span class="compare-label compare-label-compressed">Compressed</span>
         <span class="compare-divider" aria-hidden="true"></span>
@@ -306,17 +306,25 @@
       </div>
 
       <footer class="compare-controls" id="compareControls">
+        <button class="icon-button compare-play" id="comparePlay" type="button" aria-label="Play or pause" title="Play or pause" disabled>
+          <svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7V5z"/></svg>
+          <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
+        </button>
+        <button class="icon-button compare-mute" id="compareMute" type="button" aria-label="Mute or unmute" title="Mute audio" disabled>
+          <svg class="sound-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 010 7"/></svg>
+          <svg class="muted-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16 9l5 6M21 9l-5 6"/></svg>
+        </button>
         <div class="compare-timeline-wrap" id="compareTimelineWrap">
           <div class="compare-hover-preview" id="compareHoverPreview" aria-hidden="true" hidden>
             <div class="compare-hover-stage" id="compareHoverStage">
-              <img class="compare-hover-frame" id="compareHoverFrame" alt="Compressed frame preview">
+              <div class="compare-hover-thumb" id="compareHoverThumb"></div>
             </div>
             <output class="compare-hover-time" id="compareHoverTime">00:00</output>
           </div>
-          <input class="compare-timeline" id="compareTimeline" type="range" min="0" max="1000" step="1" value="0" aria-label="Comparison frame time" disabled>
+          <input class="compare-timeline" id="compareTimeline" type="range" min="0" max="1000" step="1" value="0" aria-label="Playback position" disabled>
         </div>
         <output class="compare-time" id="compareTime" for="compareTimeline">00:00 / 00:00</output>
-        <span class="compare-hint" id="compareHint">Hover for a preview · click or drag to inspect that frame.</span>
+        <span class="compare-hint" id="compareHint">Play or scrub the timeline · hover for an instant preview.</span>
       </footer>
     </section>
   </div>

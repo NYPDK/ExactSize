@@ -67,8 +67,10 @@ const elements = {
   compareOverlay: $("compareOverlay"),
   compareClose: $("compareClose"),
   compareStage: $("compareStage"),
-  compareOriginalFrame: $("compareOriginalFrame"),
-  compareCompressedFrame: $("compareCompressedFrame"),
+  compareOriginalVideo: $("compareOriginalVideo"),
+  compareCompressedVideo: $("compareCompressedVideo"),
+  comparePlay: $("comparePlay"),
+  compareMute: $("compareMute"),
   compareSlider: $("compareSlider"),
   compareLoading: $("compareLoading"),
   compareTimelineWrap: $("compareTimelineWrap"),
@@ -76,7 +78,8 @@ const elements = {
   compareTime: $("compareTime"),
   compareHint: $("compareHint"),
   compareHoverPreview: $("compareHoverPreview"),
-  compareHoverFrame: $("compareHoverFrame"),
+  compareHoverStage: $("compareHoverStage"),
+  compareHoverThumb: $("compareHoverThumb"),
   compareHoverTime: $("compareHoverTime"),
   confirmOverlay: $("confirmOverlay"),
   confirmStay: $("confirmStay"),
@@ -96,17 +99,7 @@ const state = {
   pollingTimer: null,
   toastTimer: null,
   notifiedCorrectionAttempt: 0,
-  compareDuration: 0,
-  compareLoadedSeconds: -1,
-  compareFrameAbortController: null,
-  compareFrameObjectURLs: [],
-  compareFrameTimer: null,
-  compareFrameRequest: 0,
-  compareHoverAbortController: null,
-  compareHoverObjectURLs: [],
-  compareHoverTimer: null,
-  compareHoverRequest: 0,
-  compareHoverLoadedSeconds: -1,
+  compare: null,
 };
 
 const containerCodecs = {
@@ -449,12 +442,18 @@ function bindEvents() {
     if (event.target === elements.compareOverlay) closeCompare();
   });
   elements.compareSlider.addEventListener("input", updateCompareDivider);
+  elements.comparePlay.addEventListener("click", toggleComparePlayback);
+  elements.compareMute.addEventListener("click", toggleCompareMute);
   elements.compareTimeline.addEventListener("input", handleCompareTimelineInput);
-  elements.compareTimeline.addEventListener("change", handleCompareTimelineInput);
+  elements.compareTimeline.addEventListener("pointerdown", beginCompareScrub);
   elements.compareTimeline.addEventListener("pointermove", previewCompareTimeline);
-  elements.compareTimeline.addEventListener("pointerdown", hideCompareHoverPreview);
   elements.compareTimeline.addEventListener("pointerleave", hideCompareHoverPreview);
+  elements.compareCompressedVideo.addEventListener("ended", handleCompareEnded);
+  document.addEventListener("pointerup", endCompareScrub);
+  document.addEventListener("pointercancel", endCompareScrub);
   document.addEventListener("keydown", handleCompareKeydown);
+  wireCompareVideo("input");
+  wireCompareVideo("output");
   elements.themeToggle.addEventListener("click", toggleTheme);
   elements.quitButton.addEventListener("click", quitApplication);
   elements.errorDismiss.addEventListener("click", clearError);
@@ -872,42 +871,116 @@ function setEncodingState(encoding) {
   setRuntime(encoding ? "Encoding" : "Ready", encoding ? "busy" : "ready");
 }
 
-function openCompare() {
+const COMPARE_PROFILES = {
+  h264mp4: 'video/mp4; codecs="avc1.64002A, mp4a.40.2"',
+  vp9webm: 'video/webm; codecs="vp09.00.40.08, opus"',
+};
+
+function videoFor(side) {
+  return side === "input" ? elements.compareOriginalVideo : elements.compareCompressedVideo;
+}
+
+function compareMediaURL(side, variant) {
+  return `/api/compare/media/${side}?variant=${variant}&token=${encodeURIComponent(token)}`;
+}
+
+function canPlayCompareType(mime) {
+  if (!mime) return false;
+  return elements.compareCompressedVideo.canPlayType(mime) !== "";
+}
+
+// wireCompareVideo attaches the per-side media listeners once at startup; the
+// handlers read state.compare so stale events after close are ignored.
+function wireCompareVideo(side) {
+  const video = videoFor(side);
+  video.addEventListener("loadedmetadata", () => handleCompareVideoReady(side));
+  video.addEventListener("error", () => handleCompareVideoError(side));
+}
+
+async function openCompare() {
   if (!elements.compareOverlay.hidden || elements.compareButton.hidden) return;
-  hideCompareHoverPreview();
-  cancelCompareFrameLoad();
-  releaseCompareFrameURLs();
-  state.compareDuration = Number(state.input?.duration || 0);
-  state.compareLoadedSeconds = -1;
+  const compare = {
+    duration: 0,
+    sides: null,
+    sources: { input: null, output: null },
+    fallbackTried: { input: false, output: false },
+    readySides: { input: false, output: false },
+    progress: { input: 0, output: 0 },
+    convertTimers: { input: null, output: null },
+    storyboard: null,
+    storyboardImage: null,
+    storyboardTimer: null,
+    storyboardTries: 0,
+    rafId: null,
+    syncTimer: null,
+    seekRaf: null,
+    pendingSeek: 0,
+    scrubbing: false,
+    failure: "",
+  };
+  state.compare = compare;
   elements.compareSlider.value = "50";
   updateCompareDivider();
-  const seconds = state.compareDuration > 1 ? 1 : 0;
-  elements.compareTimeline.value = String(Math.round(seconds * 1000));
-  elements.compareTimeline.max = String(Math.max(1, Math.round(state.compareDuration * 1000)));
-  elements.compareTimeline.disabled = !state.compareDuration;
-  elements.compareHint.textContent = "Hover for a preview · click or drag to inspect that frame.";
-  elements.compareOriginalFrame.hidden = false;
-  elements.compareCompressedFrame.hidden = false;
-  elements.compareLoading.textContent = `Loading matched frame at ${formatDuration(seconds)}…`;
+  elements.compareTimeline.value = "0";
+  elements.compareTimeline.disabled = true;
+  elements.comparePlay.disabled = true;
+  elements.comparePlay.classList.remove("playing");
+  elements.compareMute.disabled = true;
+  elements.compareMute.classList.remove("muted");
+  elements.compareLoading.textContent = "Loading video previews…";
   elements.compareLoading.hidden = false;
-  elements.compareTime.textContent = `${formatDuration(seconds)} / ${formatDuration(state.compareDuration)}`;
+  elements.compareHint.textContent = "Play or scrub the timeline · hover for an instant preview.";
   document.body.classList.add("compare-open");
   elements.compareOverlay.hidden = false;
-  loadCompareFrames(seconds);
   elements.compareClose.focus();
+  try {
+    const opened = await api("/api/compare/open", { method: "POST", body: "{}" });
+    if (state.compare !== compare) return;
+    compare.duration = Number(opened.duration) || 0;
+    compare.sides = opened.sides || {};
+    elements.compareTimeline.max = String(Math.max(1, Math.round(compare.duration * 1000)));
+    elements.compareTime.textContent = `${formatDuration(0)} / ${formatDuration(compare.duration)}`;
+    initCompareStoryboard(opened.storyboard);
+    for (const side of ["input", "output"]) {
+      const preview = opened.previews?.[side];
+      if (preview?.state === "ready") {
+        attachCompareSource(side, "preview");
+      } else if (preview?.state === "converting") {
+        compare.sources[side] = "converting";
+        pollCompareConvert(side);
+      } else {
+        chooseCompareSource(side);
+      }
+    }
+    updateCompareLoading();
+  } catch (error) {
+    if (state.compare !== compare) return;
+    failCompare(error.message);
+  }
 }
 
 function closeCompare() {
   if (elements.compareOverlay.hidden) return;
-  hideCompareHoverPreview();
-  cancelCompareFrameLoad();
-  releaseCompareFrameURLs();
-  for (const frame of [elements.compareOriginalFrame, elements.compareCompressedFrame]) {
-    frame.removeAttribute("src");
-    frame.hidden = true;
+  const compare = state.compare;
+  state.compare = null;
+  if (compare) {
+    if (compare.rafId) cancelAnimationFrame(compare.rafId);
+    if (compare.seekRaf) cancelAnimationFrame(compare.seekRaf);
+    if (compare.syncTimer) clearInterval(compare.syncTimer);
+    if (compare.storyboardTimer) clearTimeout(compare.storyboardTimer);
+    for (const side of ["input", "output"]) {
+      if (compare.convertTimers[side]) clearTimeout(compare.convertTimers[side]);
+    }
   }
-  state.compareDuration = 0;
-  state.compareLoadedSeconds = -1;
+  hideCompareHoverPreview();
+  // Releasing the src frees both decoders; server-side assets stay cached so
+  // reopening is instant.
+  for (const video of [elements.compareOriginalVideo, elements.compareCompressedVideo]) {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }
+  elements.comparePlay.classList.remove("playing");
   document.body.classList.remove("compare-open");
   elements.compareOverlay.hidden = true;
   elements.compareButton.focus();
@@ -919,75 +992,320 @@ function updateCompareDivider() {
   elements.compareSlider.setAttribute("aria-valuetext", `${position}% original, ${100 - position}% compressed`);
 }
 
-function cancelCompareFrameLoad() {
-  if (state.compareFrameTimer) {
-    clearTimeout(state.compareFrameTimer);
-    state.compareFrameTimer = null;
+// chooseCompareSource plays the real file whenever the browser can decode it
+// (Matroska optimistically — canPlayType under-reports it) and converts
+// otherwise. A direct attempt that errors falls back through
+// handleCompareVideoError exactly once.
+function chooseCompareSource(side) {
+  const info = state.compare?.sides?.[side];
+  if (!info) return;
+  if (info.optimistic || canPlayCompareType(info.fullMime)) {
+    attachCompareSource(side, "source");
+  } else {
+    startCompareConvert(side);
   }
-  state.compareFrameAbortController?.abort();
-  state.compareFrameAbortController = null;
-  state.compareFrameRequest += 1;
 }
 
-function releaseCompareFrameURLs() {
-  for (const url of state.compareFrameObjectURLs) URL.revokeObjectURL(url);
-  state.compareFrameObjectURLs = [];
+function attachCompareSource(side, variant) {
+  const compare = state.compare;
+  if (!compare) return;
+  compare.sources[side] = variant;
+  compare.readySides[side] = false;
+  const video = videoFor(side);
+  video.src = compareMediaURL(side, variant);
+  video.load();
 }
 
-function releaseCompareHoverURLs() {
-  for (const url of state.compareHoverObjectURLs) URL.revokeObjectURL(url);
-  state.compareHoverObjectURLs = [];
+function handleCompareVideoReady(side) {
+  const compare = state.compare;
+  if (!compare || compare.readySides[side]) return;
+  compare.readySides[side] = true;
+  if (compare.readySides.input && compare.readySides.output) finishCompareOpen();
 }
 
-function hideCompareHoverPreview() {
-  if (state.compareHoverTimer) {
-    clearTimeout(state.compareHoverTimer);
-    state.compareHoverTimer = null;
+function finishCompareOpen() {
+  const compare = state.compare;
+  if (!compare) return;
+  elements.compareTimeline.disabled = !compare.duration;
+  elements.comparePlay.disabled = false;
+  const hasAudio = Boolean(compare.sides?.output?.hasAudio);
+  elements.compareMute.disabled = !hasAudio;
+  elements.compareMute.title = hasAudio ? "Mute audio" : "The compressed output has no audio track";
+  elements.compareMute.classList.toggle("muted", !hasAudio);
+  elements.compareCompressedVideo.muted = !hasAudio;
+  elements.compareLoading.hidden = true;
+  seekCompare(Math.min(1, compare.duration));
+  startCompareSync();
+}
+
+function handleCompareVideoError(side) {
+  const compare = state.compare;
+  if (!compare || elements.compareOverlay.hidden) return;
+  if (compare.sources[side] === "source" && !compare.fallbackTried[side]) {
+    compare.fallbackTried[side] = true;
+    startCompareConvert(side);
+    return;
   }
-  state.compareHoverAbortController?.abort();
-  state.compareHoverAbortController = null;
-  state.compareHoverRequest += 1;
-  releaseCompareHoverURLs();
-  state.compareHoverLoadedSeconds = -1;
-  elements.compareHoverFrame.removeAttribute("src");
-  elements.compareHoverPreview.classList.remove("loading");
-  elements.compareHoverPreview.hidden = true;
+  if (compare.sources[side] === null) return;
+  failCompare(side === "input" ? "The original video could not be played." : "The compressed video could not be played.");
 }
 
-function clampCompareSeconds(seconds) {
-  return Math.max(0, Math.min(state.compareDuration, Number(seconds) || 0));
+function failCompare(message) {
+  const compare = state.compare;
+  if (!compare) return;
+  compare.failure = message;
+  elements.comparePlay.disabled = true;
+  elements.compareTimeline.disabled = true;
+  elements.compareLoading.textContent = message;
+  elements.compareLoading.hidden = false;
 }
 
-function updateCompareTimelinePosition(seconds) {
-  const clamped = clampCompareSeconds(seconds);
-  elements.compareTimeline.value = String(Math.round(clamped * 1000));
-  elements.compareTime.textContent = `${formatDuration(clamped)} / ${formatDuration(state.compareDuration)}`;
-  return clamped;
-}
-
-function scheduleCompareFrame(seconds, delay = 80) {
-  if (elements.compareOverlay.hidden || !state.compareDuration) return;
-  const clamped = updateCompareTimelinePosition(seconds);
-  state.compareFrameAbortController?.abort();
-  if (state.compareFrameTimer) {
-    clearTimeout(state.compareFrameTimer);
-    state.compareFrameTimer = null;
+async function startCompareConvert(side) {
+  const compare = state.compare;
+  const info = compare?.sides?.[side];
+  if (!compare || !info) return;
+  compare.sources[side] = "converting";
+  updateCompareLoading();
+  try {
+    const started = await api("/api/compare/convert", {
+      method: "POST",
+      body: JSON.stringify({
+        side,
+        verdicts: {
+          full: canPlayCompareType(info.fullMime),
+          video: canPlayCompareType(info.videoMime),
+          audio: canPlayCompareType(info.audioMime),
+        },
+        profiles: {
+          h264mp4: canPlayCompareType(COMPARE_PROFILES.h264mp4),
+          vp9webm: canPlayCompareType(COMPARE_PROFILES.vp9webm),
+        },
+      }),
+    });
+    if (state.compare !== compare) return;
+    applyCompareConvertState(side, started);
+  } catch (error) {
+    if (state.compare !== compare) return;
+    failCompare(error.message);
   }
-  if (Math.abs(clamped - state.compareLoadedSeconds) < 0.001) return;
-  state.compareFrameTimer = setTimeout(() => {
-    state.compareFrameTimer = null;
-    loadCompareFrames(clamped);
-  }, delay);
 }
 
-function handleCompareTimelineInput(event) {
+function applyCompareConvertState(side, convert) {
+  const compare = state.compare;
+  if (!compare) return;
+  if (convert.state === "ready") {
+    attachCompareSource(side, "preview");
+    updateCompareLoading();
+    return;
+  }
+  if (convert.state === "failed") {
+    failCompare(convert.error || "The playable preview could not be prepared.");
+    return;
+  }
+  compare.sources[side] = "converting";
+  compare.progress[side] = Number(convert.progress) || 0;
+  updateCompareLoading();
+  if (!compare.convertTimers[side]) {
+    compare.convertTimers[side] = setTimeout(() => {
+      compare.convertTimers[side] = null;
+      pollCompareConvert(side);
+    }, 500);
+  }
+}
+
+async function pollCompareConvert(side) {
+  const compare = state.compare;
+  if (!compare) return;
+  try {
+    const convert = await api(`/api/compare/convert/${side}`);
+    if (state.compare !== compare) return;
+    applyCompareConvertState(side, convert);
+  } catch (error) {
+    if (state.compare !== compare) return;
+    failCompare(error.message);
+  }
+}
+
+function updateCompareLoading() {
+  const compare = state.compare;
+  if (!compare || compare.failure) return;
+  const lines = [];
+  if (compare.sources.input === "converting") {
+    lines.push(`Preparing a playable original preview… ${Math.round(100 * compare.progress.input)}%`);
+  }
+  if (compare.sources.output === "converting") {
+    lines.push(`Preparing a playable compressed preview… ${Math.round(100 * compare.progress.output)}%`);
+  }
+  if (lines.length) {
+    elements.compareLoading.textContent = lines.join(" · ");
+    elements.compareLoading.hidden = false;
+  } else if (!(compare.readySides.input && compare.readySides.output)) {
+    elements.compareLoading.textContent = "Loading video previews…";
+    elements.compareLoading.hidden = false;
+  }
+}
+
+// The compressed side is the master clock and the audio source; the original
+// follows and stays muted.
+function toggleComparePlayback() {
+  const compare = state.compare;
+  if (!compare || elements.comparePlay.disabled) return;
+  const master = elements.compareCompressedVideo;
+  const original = elements.compareOriginalVideo;
+  if (master.paused) {
+    if (master.ended) seekCompare(0);
+    original.play().catch(() => {});
+    master.play().catch(() => {});
+    elements.comparePlay.classList.add("playing");
+    startCompareClock();
+  } else {
+    master.pause();
+    original.pause();
+    elements.comparePlay.classList.remove("playing");
+  }
+}
+
+function handleCompareEnded() {
+  elements.compareOriginalVideo.pause();
+  elements.comparePlay.classList.remove("playing");
+  updateCompareClock();
+}
+
+function toggleCompareMute() {
+  if (elements.compareMute.disabled) return;
+  const muted = !elements.compareCompressedVideo.muted;
+  elements.compareCompressedVideo.muted = muted;
+  elements.compareMute.classList.toggle("muted", muted);
+}
+
+function startCompareClock() {
+  const compare = state.compare;
+  if (!compare || compare.rafId) return;
+  const step = () => {
+    const current = state.compare;
+    if (!current) return;
+    current.rafId = null;
+    updateCompareClock();
+    if (!elements.compareCompressedVideo.paused) {
+      current.rafId = requestAnimationFrame(step);
+    }
+  };
+  compare.rafId = requestAnimationFrame(step);
+}
+
+function updateCompareClock() {
+  const compare = state.compare;
+  if (!compare) return;
+  const seconds = Math.min(compare.duration, elements.compareCompressedVideo.currentTime);
+  if (!compare.scrubbing) {
+    elements.compareTimeline.value = String(Math.round(seconds * 1000));
+  }
+  elements.compareTime.textContent = `${formatDuration(seconds)} / ${formatDuration(compare.duration)}`;
+}
+
+// startCompareSync keeps the two local streams within 60ms of each other; a
+// nudge on the muted side is invisible, and local files never drift far.
+function startCompareSync() {
+  const compare = state.compare;
+  if (!compare || compare.syncTimer) return;
+  compare.syncTimer = setInterval(() => {
+    const master = elements.compareCompressedVideo;
+    const original = elements.compareOriginalVideo;
+    if (master.paused || master.seeking || original.seeking) return;
+    if (Math.abs(original.currentTime - master.currentTime) > 0.06) {
+      original.currentTime = master.currentTime;
+    }
+  }, 500);
+}
+
+// seekCompare coalesces seeks through one rAF so dragging the timeline issues
+// at most one seek per frame; native seeking on local files needs no debounce.
+function seekCompare(seconds) {
+  const compare = state.compare;
+  if (!compare) return;
+  compare.pendingSeek = Math.max(0, Math.min(compare.duration, Number(seconds) || 0));
+  if (compare.seekRaf) return;
+  compare.seekRaf = requestAnimationFrame(() => {
+    const current = state.compare;
+    if (!current) return;
+    current.seekRaf = null;
+    elements.compareCompressedVideo.currentTime = current.pendingSeek;
+    elements.compareOriginalVideo.currentTime = current.pendingSeek;
+    updateCompareClock();
+  });
+}
+
+function handleCompareTimelineInput() {
   hideCompareHoverPreview();
-  const seconds = Number(elements.compareTimeline.value || 0) / 1000;
-  scheduleCompareFrame(seconds, event.type === "change" ? 0 : 80);
+  seekCompare(Number(elements.compareTimeline.value || 0) / 1000);
 }
 
+function beginCompareScrub() {
+  if (state.compare) state.compare.scrubbing = true;
+  hideCompareHoverPreview();
+}
+
+function endCompareScrub() {
+  if (state.compare) state.compare.scrubbing = false;
+}
+
+function initCompareStoryboard(manifest) {
+  const compare = state.compare;
+  if (!compare) return;
+  compare.storyboard = manifest || null;
+  if (!manifest) return;
+  if (manifest.state === "ready") {
+    loadCompareStoryboardImage();
+  } else if (manifest.state !== "failed") {
+    scheduleCompareStoryboardPoll();
+  }
+}
+
+function scheduleCompareStoryboardPoll() {
+  const compare = state.compare;
+  if (!compare || compare.storyboardTimer || compare.storyboardTries >= 60) return;
+  compare.storyboardTimer = setTimeout(async () => {
+    const current = state.compare;
+    if (current !== compare) return;
+    compare.storyboardTimer = null;
+    compare.storyboardTries += 1;
+    try {
+      const manifest = await api("/api/compare/storyboard/manifest");
+      if (state.compare !== compare) return;
+      compare.storyboard = manifest;
+      if (manifest.state === "ready") {
+        loadCompareStoryboardImage();
+      } else if (manifest.state !== "failed") {
+        scheduleCompareStoryboardPoll();
+      }
+    } catch {
+      if (state.compare === compare) scheduleCompareStoryboardPoll();
+    }
+  }, 1000);
+}
+
+function loadCompareStoryboardImage() {
+  const compare = state.compare;
+  if (!compare || compare.storyboardImage) return;
+  const image = new Image();
+  image.src = `/api/compare/storyboard?token=${encodeURIComponent(token)}`;
+  image
+    .decode()
+    .then(() => {
+      if (state.compare !== compare || !compare.storyboard) return;
+      compare.storyboardImage = image;
+      const story = compare.storyboard;
+      elements.compareHoverStage.style.aspectRatio = `${story.tileWidth} / ${story.tileHeight}`;
+      elements.compareHoverThumb.style.backgroundImage = `url("${image.src}")`;
+    })
+    .catch(() => {});
+}
+
+// previewCompareTimeline is a pure local lookup: position the tooltip, then
+// point the sprite background at the hovered tile. No network per hover.
 function previewCompareTimeline(event) {
-  if (elements.compareOverlay.hidden || !state.compareDuration || elements.compareTimeline.disabled) return;
+  const compare = state.compare;
+  if (!compare || elements.compareOverlay.hidden || !compare.duration || elements.compareTimeline.disabled) return;
   if (event.buttons !== 0) {
     hideCompareHoverPreview();
     return;
@@ -995,7 +1313,7 @@ function previewCompareTimeline(event) {
   const bounds = elements.compareTimeline.getBoundingClientRect();
   if (!bounds.width) return;
   const position = Math.max(0, Math.min(1, (event.clientX - bounds.left) / bounds.width));
-  const seconds = state.compareDuration * position;
+  const seconds = compare.duration * position;
   const wrapperBounds = elements.compareTimelineWrap.getBoundingClientRect();
   const previewHalfWidth = Math.min(96, wrapperBounds.width / 2);
   const pointerX = event.clientX - wrapperBounds.left;
@@ -1003,136 +1321,36 @@ function previewCompareTimeline(event) {
   elements.compareHoverPreview.style.left = `${previewCenter}px`;
   elements.compareHoverTime.textContent = formatDuration(seconds);
   elements.compareHoverPreview.hidden = false;
-  scheduleCompareHoverFrame(seconds, 70);
-}
-
-async function fetchCompareFrame(side, seconds, signal) {
-  const headers = new Headers({ "X-ExactSize-Token": token });
-  const response = await fetch(`/api/compare/frame/${side}?time=${seconds.toFixed(3)}`, { headers, signal });
-  if (!response.ok) {
-    const payload = await response.json().catch(() => ({}));
-    throw new Error(payload.error || `Frame request failed (${response.status})`);
-  }
-  return response.blob();
-}
-
-async function createDecodedCompareFrameURLs(seconds, signal) {
-  const blobs = await Promise.all([
-    fetchCompareFrame("input", seconds, signal),
-    fetchCompareFrame("output", seconds, signal),
-  ]);
-  if (signal.aborted) throw new DOMException("Frame request canceled", "AbortError");
-  const urls = blobs.map((blob) => URL.createObjectURL(blob));
-  const decodedFrames = [new Image(), new Image()];
-  decodedFrames[0].src = urls[0];
-  decodedFrames[1].src = urls[1];
-  try {
-    await Promise.all(decodedFrames.map((frame) => frame.decode()));
-  } catch (error) {
-    urls.forEach((url) => URL.revokeObjectURL(url));
-    throw error;
-  }
-  return urls;
-}
-
-async function createDecodedCompareHoverURL(seconds, signal) {
-  const blob = await fetchCompareFrame("output", seconds, signal);
-  if (signal.aborted) throw new DOMException("Frame request canceled", "AbortError");
-  const url = URL.createObjectURL(blob);
-  const decodedFrame = new Image();
-  decodedFrame.src = url;
-  try {
-    await decodedFrame.decode();
-  } catch (error) {
-    URL.revokeObjectURL(url);
-    throw error;
-  }
-  return url;
-}
-
-function scheduleCompareHoverFrame(seconds, delay = 70) {
-  if (elements.compareOverlay.hidden || elements.compareHoverPreview.hidden || !state.compareDuration) return;
-  const clamped = clampCompareSeconds(seconds);
-  state.compareHoverAbortController?.abort();
-  if (state.compareHoverTimer) {
-    clearTimeout(state.compareHoverTimer);
-    state.compareHoverTimer = null;
-  }
-  if (Math.abs(clamped - state.compareHoverLoadedSeconds) < 0.001) {
+  const story = compare.storyboard;
+  if (compare.storyboardImage && story?.state === "ready" && story.interval > 0) {
+    const index = Math.min(story.count - 1, Math.floor(seconds / story.interval));
+    const column = index % story.columns;
+    const row = Math.floor(index / story.columns);
+    elements.compareHoverThumb.style.backgroundPosition = `${-column * story.tileWidth}px ${-row * story.tileHeight}px`;
     elements.compareHoverPreview.classList.remove("loading");
-    return;
-  }
-  elements.compareHoverPreview.classList.add("loading");
-  state.compareHoverTimer = setTimeout(() => {
-    state.compareHoverTimer = null;
-    loadCompareHoverFrames(clamped);
-  }, delay);
-}
-
-async function loadCompareHoverFrames(seconds) {
-  if (elements.compareOverlay.hidden || elements.compareHoverPreview.hidden) return;
-  state.compareHoverAbortController?.abort();
-  const controller = new AbortController();
-  state.compareHoverAbortController = controller;
-  const request = ++state.compareHoverRequest;
-  try {
-    const url = await createDecodedCompareHoverURL(seconds, controller.signal);
-    if (controller.signal.aborted || request !== state.compareHoverRequest || elements.compareOverlay.hidden || elements.compareHoverPreview.hidden) {
-      URL.revokeObjectURL(url);
-      return;
-    }
-    releaseCompareHoverURLs();
-    state.compareHoverObjectURLs = [url];
-    elements.compareHoverFrame.src = url;
-    state.compareHoverLoadedSeconds = seconds;
-    elements.compareHoverPreview.classList.remove("loading");
-  } catch (error) {
-    if (controller.signal.aborted || elements.compareOverlay.hidden || elements.compareHoverPreview.hidden) return;
-    elements.compareHoverPreview.classList.remove("loading");
-  } finally {
-    if (state.compareHoverAbortController === controller) state.compareHoverAbortController = null;
-  }
-}
-
-async function loadCompareFrames(seconds) {
-  if (elements.compareOverlay.hidden) return;
-  state.compareFrameAbortController?.abort();
-  const controller = new AbortController();
-  state.compareFrameAbortController = controller;
-  const request = ++state.compareFrameRequest;
-  const firstLoad = state.compareFrameObjectURLs.length === 0;
-  if (firstLoad) {
-    elements.compareLoading.textContent = `Loading matched frame at ${formatDuration(seconds)}…`;
-    elements.compareLoading.hidden = false;
   } else {
-    elements.compareLoading.hidden = true;
+    elements.compareHoverPreview.classList.add("loading");
   }
-  try {
-    const urls = await createDecodedCompareFrameURLs(seconds, controller.signal);
-    if (controller.signal.aborted || request !== state.compareFrameRequest || elements.compareOverlay.hidden) {
-      urls.forEach((url) => URL.revokeObjectURL(url));
-      return;
-    }
-    releaseCompareFrameURLs();
-    state.compareFrameObjectURLs = urls;
-    elements.compareOriginalFrame.src = urls[0];
-    elements.compareCompressedFrame.src = urls[1];
-    state.compareLoadedSeconds = seconds;
-    elements.compareLoading.hidden = true;
-  } catch (error) {
-    if (controller.signal.aborted || elements.compareOverlay.hidden) return;
-    elements.compareLoading.textContent = `That comparison frame could not be loaded: ${error.message}`;
-    elements.compareLoading.hidden = false;
-  } finally {
-    if (state.compareFrameAbortController === controller) state.compareFrameAbortController = null;
-  }
+}
+
+function hideCompareHoverPreview() {
+  elements.compareHoverPreview.classList.remove("loading");
+  elements.compareHoverPreview.hidden = true;
 }
 
 function handleCompareKeydown(event) {
   if (elements.compareOverlay.hidden) return;
+  const inRange = event.target instanceof HTMLInputElement && event.target.type === "range";
   if (event.key === "Escape") {
     event.preventDefault();
     closeCompare();
+  } else if (event.key === " " && !inRange) {
+    event.preventDefault();
+    toggleComparePlayback();
+  } else if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && !inRange) {
+    event.preventDefault();
+    const delta = event.key === "ArrowLeft" ? -5 : 5;
+    seekCompare(elements.compareCompressedVideo.currentTime + delta);
   }
 }
 
