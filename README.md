@@ -19,10 +19,10 @@ FFmpeg is bundled. On first run the AppImage adds itself to your app menu with i
 - **GPU encoding**: NVENC, Quick Sync, VAAPI, and AMF. Every encoder is test-run at launch, so only ones that actually work on your machine are offered, and they're preferred by default.
 - **Modern codecs**: H.264, H.265, H.266/VVC, AV1, VP9. AV2 is wired up and unlocks itself the moment FFmpeg ships an encoder.
 - **Quick presets**: one-click size targets (10–200 MB), speed/quality tiers from Fastest to Higher quality, a dual-handle 5 fps-to-source adaptive frame-rate range that tests at most maximum/midpoint/minimum and restarts bitrate correction at every tier, and an independent Automatic resolution toggle that downscales from the selected starting resolution only after all bitrate and FPS options are exhausted.
-- **Visual comparison**: after a successful compression, open a large before/after viewer, drag the divider, hover over the timeline for a lightweight compressed-frame thumbnail, or click and drag to inspect both encodes in the main view—all without browser codec limits, preview encodes, or temporary files.
+- **Visual comparison**: after a successful compression, open a large before/after viewer and press play — both sides run in sync with the compressed track's audio, the divider stays draggable mid-playback, seeking is native and instant, and hovering the timeline shows storyboard thumbnails with zero decoding lag. Codecs the browser cannot decode (H.266, most H.265) get a one-time playable preview generated in the background and cleaned up automatically.
 - **Single instance**: launching ExactSize while it is already open shows a native warning and exits the new process without spawning another app window or leaving a lock file behind.
 - **Remux / Mux**: switch containers losslessly without re-encoding; if only the audio doesn't fit the new container, Mux copies the video untouched and converts just the audio.
-- **Drag & drop that behaves**: dropped files keep their real location, so outputs land next to the source, not in /tmp.
+- **Drag & drop that behaves**: dropped files keep their real location — checked against your recent-documents history first, then a fast, bounded scan of likely folders and external drives — so outputs land next to the source, not in /tmp.
 - **At home on KDE**: frameless window with native drag, resize, and rounded corners.
 - **Private by design**: no telemetry, no accounts, no network uploads. Everything stays on 127.0.0.1.
 
