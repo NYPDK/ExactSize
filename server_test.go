@@ -1,18 +1,12 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"image/png"
-	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 )
 
@@ -236,99 +230,6 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 		if strings.Contains(markup, removedSplitPreview) || strings.Contains(styles, removedSplitPreview) {
 			t.Fatalf("hover preview must contain only the compressed frame, found %q", removedSplitPreview)
 		}
-	}
-}
-
-func TestCompareFramesAreScopedAuthenticatedAndGenerated(t *testing.T) {
-	dir := t.TempDir()
-	input := filepath.Join(dir, "original.mp4")
-	output := filepath.Join(dir, "compressed.mp4")
-	if err := os.WriteFile(input, []byte("original-video"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(output, []byte("compressed-video"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	job := newJob(EncodeRequest{Input: input, Output: output})
-	job.set(func(status *JobSnapshot) {
-		status.State = "completed"
-		status.Message = "Video compressed successfully"
-	})
-	callLog := filepath.Join(dir, "ffmpeg-args")
-	t.Setenv("EXACTSIZE_COMPARE_TEST_LOG", callLog)
-	fakeFFmpeg := filepath.Join(dir, "ffmpeg")
-	fakeScript := `#!/bin/sh
-printf '%s\n' "$@" > "$EXACTSIZE_COMPARE_TEST_LOG"
-printf '\211PNG\r\n\032\nframe'
-`
-	if err := os.WriteFile(fakeFFmpeg, []byte(fakeScript), 0o755); err != nil {
-		t.Fatal(err)
-	}
-
-	app := newApp(fakeFFmpeg, "", "compare-secret", fstest.MapFS{})
-	app.job = job
-	handler := app.routes()
-	frame := func(path string, authenticated bool) *httptest.ResponseRecorder {
-		recorder := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodGet, path, nil)
-		if authenticated {
-			req.Header.Set("X-ExactSize-Token", "compare-secret")
-		}
-		handler.ServeHTTP(recorder, req)
-		return recorder
-	}
-	if got := frame("/api/compare/frame/input?time=1.25", false); got.Code != http.StatusForbidden {
-		t.Fatalf("frame extraction without auth returned %d, want 403", got.Code)
-	}
-	if got := frame("/api/compare/frame/input?time=invalid", true); got.Code != http.StatusBadRequest {
-		t.Fatalf("invalid frame timestamp returned %d, want 400", got.Code)
-	}
-	if got := frame("/api/compare/frame/elsewhere?time=1.25", true); got.Code != http.StatusNotFound {
-		t.Fatalf("unknown frame side returned %d, want 404", got.Code)
-	}
-	preview := frame("/api/compare/frame/input?time=1.25", true)
-	if preview.Code != http.StatusOK || !strings.HasPrefix(preview.Body.String(), "\x89PNG") {
-		t.Fatalf("comparison frame = %d %q, want PNG response", preview.Code, preview.Body.String())
-	}
-	if got := preview.Header().Get("Content-Type"); got != "image/png" {
-		t.Fatalf("comparison frame Content-Type = %q, want image/png", got)
-	}
-	if got := preview.Header().Get("Content-Security-Policy"); !strings.Contains(got, "img-src 'self' data: blob:") {
-		t.Fatalf("comparison response CSP does not permit generated frame images: %q", got)
-	}
-	args, err := os.ReadFile(callLog)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, expected := range []string{"1.250", input, "pipe:1"} {
-		if !strings.Contains(string(args), expected) {
-			t.Errorf("FFmpeg frame arguments are missing %q:\n%s", expected, args)
-		}
-	}
-
-	job.request.Remux = true
-	if got := frame("/api/compare/frame/input?time=1.25", true); got.Code != http.StatusConflict {
-		t.Fatalf("remux frame comparison returned %d, want 409", got.Code)
-	}
-}
-
-func TestRealCompareFrameWhenConfigured(t *testing.T) {
-	input := os.Getenv("EXACTSIZE_REAL_COMPARE_INPUT")
-	ffmpeg := os.Getenv("EXACTSIZE_REAL_COMPARE_FFMPEG")
-	if input == "" || ffmpeg == "" {
-		t.Skip("set EXACTSIZE_REAL_COMPARE_INPUT and EXACTSIZE_REAL_COMPARE_FFMPEG for the real-media integration check")
-	}
-
-	app := newApp(ffmpeg, "", "", fstest.MapFS{})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	frame, err := app.extractCompareFrame(ctx, input, 35)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := png.Decode(bytes.NewReader(frame)); err != nil {
-		t.Fatalf("decode extracted comparison frame: %v", err)
 	}
 }
 

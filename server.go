@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"encoding/xml"
@@ -10,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"math"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -354,7 +351,6 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /api/jobs/current", a.auth(a.handleCurrentJob))
 	mux.HandleFunc("DELETE /api/jobs/current", a.auth(a.handleCancelJob))
 	mux.HandleFunc("POST /api/compare/open", a.auth(a.handleCompareOpen))
-	mux.HandleFunc("GET /api/compare/frame/{side}", a.auth(a.handleCompareFrame))
 	mux.HandleFunc("GET /api/compare/media/{side}", a.authMedia(a.handleCompareMedia))
 	mux.HandleFunc("GET /api/compare/storyboard", a.authMedia(a.handleCompareStoryboard))
 	mux.HandleFunc("GET /api/compare/storyboard/manifest", a.auth(a.handleCompareStoryboardManifest))
@@ -605,78 +601,6 @@ func (a *App) currentComparisonJob() (*Job, int, string) {
 		return nil, http.StatusConflict, "comparison is available only after a successful compression"
 	}
 	return job, 0, ""
-}
-
-// handleCompareFrame supplies the matched stills used by timeline hover
-// scrubbing. Extracting only the requested timestamp avoids browser codec
-// limits, full preview encodes, and comparison files in /tmp.
-func (a *App) handleCompareFrame(w http.ResponseWriter, r *http.Request) {
-	job, status, message := a.currentComparisonJob()
-	if job == nil {
-		writeError(w, status, message)
-		return
-	}
-
-	seconds, err := strconv.ParseFloat(r.URL.Query().Get("time"), 64)
-	if err != nil || seconds < 0 || seconds > 24*60*60 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
-		writeError(w, http.StatusBadRequest, "comparison time must be between 0 and 24 hours")
-		return
-	}
-	var path string
-	switch r.PathValue("side") {
-	case "input":
-		path = job.request.Input
-	case "output":
-		path = job.request.Output
-	default:
-		writeError(w, http.StatusNotFound, "unknown comparison side")
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-	defer cancel()
-	frame, err := a.extractCompareFrame(ctx, path, seconds)
-	if err != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			writeError(w, http.StatusGatewayTimeout, "comparison frame extraction timed out")
-			return
-		}
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Content-Length", strconv.Itoa(len(frame)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(frame)
-}
-
-func (a *App) extractCompareFrame(ctx context.Context, source string, seconds float64) ([]byte, error) {
-	filter := "scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:reset_sar=1,format=rgb24"
-	args := []string{
-		"-hide_banner", "-nostdin", "-loglevel", "error",
-		"-ss", strconv.FormatFloat(seconds, 'f', 3, 64),
-		"-i", source,
-		"-map", "0:v:0", "-frames:v", "1", "-an", "-sn", "-dn",
-		"-vf", filter, "-c:v", "png", "-compression_level", "3",
-		"-f", "image2pipe", "pipe:1",
-	}
-	var output bytes.Buffer
-	var stderr bytes.Buffer
-	command := exec.CommandContext(ctx, a.ffmpeg, args...)
-	command.Stdout = &output
-	command.Stderr = &stderr
-	err := command.Run()
-	if err != nil {
-		detail := strings.TrimSpace(stderr.String())
-		if detail == "" {
-			detail = err.Error()
-		}
-		return nil, errors.New(detail)
-	}
-	if output.Len() == 0 {
-		return nil, errors.New("FFmpeg returned an empty comparison frame")
-	}
-	return output.Bytes(), nil
 }
 
 func (a *App) handleCancelJob(w http.ResponseWriter, _ *http.Request) {
