@@ -349,7 +349,7 @@ from hover events, ever).
 | Direct play errors (codec false positive) | Auto-switch that side to convert; one retry layer only |
 | Conversion FFmpeg fails | Stage shows message + stderr tail; controls disabled |
 | Storyboard fails or slow | Hover shows time-only tooltip; nothing else degrades |
-| New encode started / job replaced | Media/convert endpoints return 409; viewer closes with a toast |
+| New encode started / job replaced | Media/convert endpoints return 409; the viewer surfaces it as a stage failure message |
 | Storyboard/convert processes at teardown | Killed via assets ctx; temp dir removed; stale sweeper covers crashes |
 
 ## Performance and fidelity trade-offs (accepted)

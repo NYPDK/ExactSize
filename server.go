@@ -378,7 +378,8 @@ func securityHeaders(next http.Handler) http.Handler {
 
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-ExactSize-Token") != a.token {
+		token := r.Header.Get("X-ExactSize-Token")
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) != 1 {
 			writeError(w, http.StatusForbidden, "invalid application session")
 			return
 		}

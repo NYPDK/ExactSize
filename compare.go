@@ -622,9 +622,11 @@ func (a *App) handleCompareMedia(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, "", stat.ModTime(), file)
 }
 
-// handleCompareStoryboard serves the hover sprite once it is ready; a plain
-// image endpoint (rather than a base64 blob in the manifest) lets the browser
-// cache the sprite and fetch it only once a hover actually needs it.
+// handleCompareStoryboard serves the hover sprite once it is ready. A plain
+// image endpoint, rather than a base64 blob in the manifest, is what lets
+// hovers stay cheap: the global Cache-Control: no-store header rules out
+// browser caching, but the client only fetches the sprite once per viewer
+// open and reuses the decoded Image for every hover after that.
 func (a *App) handleCompareStoryboard(w http.ResponseWriter, r *http.Request) {
 	job, status, message := a.currentComparisonJob()
 	if job == nil {
@@ -776,6 +778,9 @@ func (c *compareAssets) runConvert(ffmpeg, side string, info VideoInfo, plan con
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
 			detail = err.Error()
+		}
+		if len(detail) > 4096 {
+			detail = detail[len(detail)-4096:]
 		}
 		fail(detail)
 		return
