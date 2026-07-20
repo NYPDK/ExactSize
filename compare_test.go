@@ -1,7 +1,10 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -202,5 +205,109 @@ func TestCompareTimelineDuration(t *testing.T) {
 				t.Fatalf("compareTimelineDuration(%v, %v) = %v, want %v", tc.input, tc.output, got, tc.want)
 			}
 		})
+	}
+}
+
+// fakeCompareFFmpeg writes a script that logs its args and creates the last
+// argument as a file, standing in for both storyboard and convert runs.
+func fakeCompareFFmpeg(t *testing.T, dir string) string {
+	t.Helper()
+	script := `#!/bin/sh
+log="$EXACTSIZE_COMPARE_TEST_LOG"
+[ -n "$log" ] && printf '%s\n' "$@" >> "$log"
+for last; do :; done
+case "$last" in
+  pipe:*) printf 'out_time_us=500000\nprogress=end\n' ;;
+  *) printf 'jpegdata' > "$last" ;;
+esac
+`
+	path := filepath.Join(dir, "ffmpeg")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func completedCompareJob(t *testing.T, dir string) *Job {
+	t.Helper()
+	input := filepath.Join(dir, "original.mp4")
+	output := filepath.Join(dir, "compressed.mp4")
+	for _, path := range []string{input, output} {
+		if err := os.WriteFile(path, []byte("media-bytes"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := newJob(EncodeRequest{Input: input, Output: output})
+	job.set(func(status *JobSnapshot) { status.State = "completed" })
+	return job
+}
+
+func TestEnsureCompareAssetsGeneratesStoryboardOnce(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	callLog := filepath.Join(dir, "calls")
+	t.Setenv("EXACTSIZE_COMPARE_TEST_LOG", callLog)
+	app := newApp(fakeCompareFFmpeg(t, dir), "", "secret", nil)
+	job := completedCompareJob(t, dir)
+	app.job = job
+
+	assets := app.ensureCompareAssets(job)
+	if assets == nil {
+		t.Fatal("ensureCompareAssets returned nil for a completed job")
+	}
+	// Seed the probe cache so storyboard generation does not need ffprobe.
+	assets.mu.Lock()
+	assets.probes["output"] = VideoInfo{Path: job.request.Output, Duration: 30, Width: 1920, Height: 1080, VideoCodec: "h264"}
+	assets.mu.Unlock()
+	assets.generateStoryboard(app.ffmpeg)
+
+	assets.mu.Lock()
+	story := assets.story
+	assets.mu.Unlock()
+	if story.State != "ready" || story.Count != 30 || story.TileHeight != 108 {
+		t.Fatalf("storyboard after generation = %+v", story)
+	}
+	sprite := filepath.Join(assets.dir, "storyboard.jpg")
+	if _, err := os.Stat(sprite); err != nil {
+		t.Fatalf("storyboard sprite missing: %v", err)
+	}
+	args, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"fps=30/30", "scale=192:-2", "tile=10x3", "-q:v", job.request.Output} {
+		if !strings.Contains(string(args), expected) {
+			t.Errorf("storyboard FFmpeg args missing %q:\n%s", expected, args)
+		}
+	}
+	if again := app.ensureCompareAssets(job); again != assets {
+		t.Fatal("ensureCompareAssets must reuse the job's assets")
+	}
+}
+
+func TestTeardownCompareAssetsRemovesDirAndStopsWork(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	app := newApp(fakeCompareFFmpeg(t, dir), "", "secret", nil)
+	job := completedCompareJob(t, dir)
+	app.job = job
+	assets := app.ensureCompareAssets(job)
+	created, err := assets.ensureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(filepath.Base(created), comparePreviewPrefix) {
+		t.Fatalf("preview dir %q must carry the sweeper prefix", created)
+	}
+
+	app.teardownCompareAssets()
+	if _, err := os.Stat(created); !os.IsNotExist(err) {
+		t.Fatalf("teardown left the preview dir behind: %v", err)
+	}
+	if assets.ctx.Err() == nil {
+		t.Fatal("teardown must cancel the assets context")
+	}
+	if app.compare != nil {
+		t.Fatal("teardown must clear App.compare")
 	}
 }

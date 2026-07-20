@@ -39,6 +39,7 @@ type App struct {
 	job      *Job
 	shutdown func()
 	uploads  []string
+	compare  *compareAssets
 }
 
 const comparePreviewPrefix = "exactsize-compare-"
@@ -539,6 +540,8 @@ func (a *App) handleStartJob(w http.ResponseWriter, r *http.Request) {
 		request.VAAPIDevice = a.vaapiDevices[request.Encoder]
 	}
 
+	a.teardownCompareAssets()
+
 	a.mu.Lock()
 	if a.job != nil && !a.job.isTerminal() {
 		a.mu.Unlock()
@@ -549,7 +552,10 @@ func (a *App) handleStartJob(w http.ResponseWriter, r *http.Request) {
 	a.job = job
 	a.mu.Unlock()
 
-	go job.run(a.ffmpeg, a.ffprobe)
+	go func() {
+		job.run(a.ffmpeg, a.ffprobe)
+		a.prepareCompareAssets(job)
+	}()
 	writeJSON(w, http.StatusAccepted, job.snapshot())
 }
 
@@ -674,6 +680,7 @@ func (a *App) cancelCurrentJob() {
 	for _, path := range uploads {
 		_ = os.Remove(path)
 	}
+	a.teardownCompareAssets()
 }
 
 func cleanupStaleComparePreviews() {

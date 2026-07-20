@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 )
 
 // Comparison playback: sides play directly whenever the browser can decode
@@ -265,4 +271,205 @@ type storyboardState struct {
 func compareTimelineDuration(input, output float64) float64 {
 	duration := math.Min(input, output) - 0.05
 	return math.Max(0.1, math.Round(duration*1000)/1000)
+}
+
+// convertState tracks one side's converted preview.
+type convertState struct {
+	State    string  `json:"state"`
+	Progress float64 `json:"progress"`
+	Error    string  `json:"error,omitempty"`
+	path     string
+}
+
+// compareAssets owns everything derived from one completed job: cached
+// probes, the storyboard sprite, and converted previews. It lives until the
+// next job starts or the app quits; cleanupStaleComparePreviews covers
+// crashes.
+type compareAssets struct {
+	job    *Job
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu       sync.Mutex
+	dir      string
+	probes   map[string]VideoInfo
+	story    storyboardState
+	converts map[string]*convertState
+}
+
+// ensureCompareAssets returns the assets for job, creating them on first use.
+// Callers hold no locks; App.mu guards the App.compare pointer.
+func (a *App) ensureCompareAssets(job *Job) *compareAssets {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.compare != nil && a.compare.job == job {
+		return a.compare
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	a.compare = &compareAssets{
+		job:      job,
+		ctx:      ctx,
+		cancel:   cancel,
+		probes:   map[string]VideoInfo{},
+		story:    storyboardState{State: "pending"},
+		converts: map[string]*convertState{"input": {State: "none"}, "output": {State: "none"}},
+	}
+	return a.compare
+}
+
+// prepareCompareAssets runs after job.run returns: eligible encodes get their
+// storyboard generated immediately so hover previews are ready before the
+// viewer opens.
+func (a *App) prepareCompareAssets(job *Job) {
+	snapshot := job.snapshot()
+	if snapshot.State != "completed" || job.request.Remux || job.request.MuxAudio {
+		return
+	}
+	assets := a.ensureCompareAssets(job)
+	if _, err := assets.sideProbe(a.ffprobe, "output"); err != nil {
+		return
+	}
+	assets.generateStoryboard(a.ffmpeg)
+}
+
+// teardownCompareAssets cancels and deletes the current job's compare
+// assets, if any, so a stale preview directory and its background work never
+// outlive the job that created them. It is always safe to call: most jobs
+// never generate compare assets at all, so the common case is a no-op.
+func (a *App) teardownCompareAssets() {
+	a.mu.Lock()
+	assets := a.compare
+	a.compare = nil
+	a.mu.Unlock()
+	if assets == nil {
+		return
+	}
+	assets.cancel()
+	assets.mu.Lock()
+	dir := assets.dir
+	assets.mu.Unlock()
+	if dir != "" {
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// sidePath maps a side name onto the real file it represents.
+func (c *compareAssets) sidePath(side string) (string, bool) {
+	switch side {
+	case "input":
+		return c.job.request.Input, true
+	case "output":
+		return c.job.request.Output, true
+	default:
+		return "", false
+	}
+}
+
+// sideProbe caches ffprobe results per side; the viewer and every follow-up
+// endpoint reuse them.
+func (c *compareAssets) sideProbe(ffprobe, side string) (VideoInfo, error) {
+	path, ok := c.sidePath(side)
+	if !ok {
+		return VideoInfo{}, errors.New("unknown comparison side")
+	}
+	c.mu.Lock()
+	cached, ok := c.probes[side]
+	c.mu.Unlock()
+	if ok {
+		return cached, nil
+	}
+	info, err := probeVideo(c.ctx, ffprobe, path)
+	if err != nil {
+		return VideoInfo{}, err
+	}
+	c.mu.Lock()
+	c.probes[side] = info
+	c.mu.Unlock()
+	return info, nil
+}
+
+// ensureDir lazily creates the job's preview directory using the PID-scoped
+// prefix the stale sweeper understands.
+func (c *compareAssets) ensureDir() (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dir != "" {
+		return c.dir, nil
+	}
+	dir, err := os.MkdirTemp(os.TempDir(), comparePreviewPrefix+strconv.Itoa(os.Getpid())+"-")
+	if err != nil {
+		return "", err
+	}
+	c.dir = dir
+	return dir, nil
+}
+
+// generateStoryboard renders the hover sprite from the compressed output in
+// one FFmpeg pass. Failure is non-fatal: hovers fall back to time-only
+// tooltips.
+func (c *compareAssets) generateStoryboard(ffmpeg string) {
+	c.mu.Lock()
+	if c.story.State == "generating" || c.story.State == "ready" {
+		c.mu.Unlock()
+		return
+	}
+	info := c.probes["output"]
+	if info.Duration <= 0 {
+		// The probe cache is cold (no caller has probed the output yet);
+		// leave the state pending so a later trigger can generate.
+		c.mu.Unlock()
+		return
+	}
+	spec := storyboardSpecFor(info.Duration, info.Width, info.Height)
+	c.story = storyboardState{
+		State:      "generating",
+		Interval:   spec.Interval,
+		Count:      spec.Count,
+		Columns:    spec.Columns,
+		TileWidth:  spec.TileWidth,
+		TileHeight: spec.TileHeight,
+	}
+	c.mu.Unlock()
+
+	fail := func() {
+		c.mu.Lock()
+		c.story.State = "failed"
+		c.mu.Unlock()
+	}
+	dir, err := c.ensureDir()
+	if err != nil {
+		fail()
+		return
+	}
+	sprite := filepath.Join(dir, "storyboard.jpg")
+	filter := "fps=" + strconv.Itoa(spec.Count) + "/" + strconv.FormatFloat(info.Duration, 'f', -1, 64) +
+		",scale=192:-2,tile=" + strconv.Itoa(spec.Columns) + "x" + strconv.Itoa(spec.Rows)
+	args := []string{
+		"-hide_banner", "-nostdin", "-loglevel", "error",
+		"-i", info.Path,
+		"-map", "0:v:0", "-an", "-sn", "-dn",
+		"-vf", filter, "-frames:v", "1", "-q:v", "4",
+		"-f", "image2", "-y", sprite,
+	}
+	var stderr limitedBuffer
+	command := exec.CommandContext(c.ctx, ffmpeg, args...)
+	command.Stderr = &stderr
+	if err := command.Run(); err != nil {
+		fail()
+		return
+	}
+	if stat, err := os.Stat(sprite); err != nil || stat.Size() == 0 {
+		fail()
+		return
+	}
+	c.mu.Lock()
+	c.story.State = "ready"
+	c.mu.Unlock()
+}
+
+// storyboardSnapshot returns a copy of the manifest for JSON responses.
+func (c *compareAssets) storyboardSnapshot() storyboardState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.story
 }
