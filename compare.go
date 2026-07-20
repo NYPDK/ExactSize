@@ -756,6 +756,19 @@ func (c *compareAssets) runConvert(ffmpeg, side string, info VideoInfo, plan con
 			c.mu.Unlock()
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		// A read failure on the progress pipe leaves FFmpeg still running;
+		// mirror Job.runFFmpeg's sibling handling by killing it before
+		// reporting failure, rather than waiting indefinitely for an exit
+		// that a broken pipe may never deliver.
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		if c.ctx.Err() != nil {
+			return
+		}
+		fail(err.Error())
+		return
+	}
 	if err := command.Wait(); err != nil {
 		if c.ctx.Err() != nil {
 			return
@@ -775,7 +788,10 @@ func (c *compareAssets) runConvert(ffmpeg, side string, info VideoInfo, plan con
 	c.mu.Unlock()
 }
 
-// handleCompareConvertStart validates the request and kicks the conversion.
+// handleCompareConvertStart turns the client's canPlayType verdicts into the
+// cheapest playable preview via planConversion, and answers idempotently so
+// a reopened viewer resumes polling an in-progress or finished conversion
+// instead of re-encoding from scratch.
 func (a *App) handleCompareConvertStart(w http.ResponseWriter, r *http.Request) {
 	job, status, message := a.currentComparisonJob()
 	if job == nil {
@@ -804,7 +820,10 @@ func (a *App) handleCompareConvertStart(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusAccepted, assets.startConvert(a.ffmpeg, request.Side, info, request.Verdicts, request.Profiles))
 }
 
-// handleCompareConvertStatus reports one side's conversion progress.
+// handleCompareConvertStatus reports one side's conversion progress; the
+// client polls it every 500ms to drive the "Preparing playable preview… N%"
+// overlay until the state flips to ready and the media endpoint can serve
+// the result.
 func (a *App) handleCompareConvertStatus(w http.ResponseWriter, r *http.Request) {
 	job, status, message := a.currentComparisonJob()
 	if job == nil {
