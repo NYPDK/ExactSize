@@ -531,7 +531,7 @@ func (c *compareAssets) convertSnapshot(side string) convertState {
 // handleCompareOpen is the viewer's single bootstrap call: cached probes for
 // both sides, the storyboard manifest, and any converted previews that
 // already exist, so a reopened viewer is instant.
-func (a *App) handleCompareOpen(w http.ResponseWriter, r *http.Request) {
+func (a *App) handleCompareOpen(w http.ResponseWriter, _ *http.Request) {
 	job, status, message := a.currentComparisonJob()
 	if job == nil {
 		writeError(w, status, message)
