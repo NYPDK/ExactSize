@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"math"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -74,28 +76,143 @@ func xdgUserDir(key, home string) string {
 
 // dropSearchDirs are the places a dragged-in video most plausibly came from,
 // in priority order. Browsers hand us file content without a path, so the
-// original is found again by name and size.
+// original is found again by name and size. The home directory goes last:
+// its recursive walk is the noisiest, and it must not starve the
+// removable-drive roots of the shared search budget.
 func dropSearchDirs() []string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil
 	}
 	var dirs []string
-	for _, key := range []string{"VIDEOS", "DOWNLOAD", "DESKTOP"} {
-		if dir := xdgUserDir(key, home); dir != "" {
+	seen := map[string]bool{}
+	appendDir := func(dir string) {
+		dir = filepath.Clean(dir)
+		if dir != "." && !seen[dir] {
+			seen[dir] = true
 			dirs = append(dirs, dir)
 		}
 	}
-	return append(dirs, home)
+	for _, key := range []string{"VIDEOS", "DOWNLOAD", "DESKTOP", "DOCUMENTS", "PICTURES", "MUSIC"} {
+		// xdg-user-dirs records a disabled folder as $HOME itself; the home
+		// directory joins the list separately, at the end.
+		if dir := xdgUserDir(key, home); filepath.Clean(dir) != home {
+			appendDir(dir)
+		}
+	}
+	// udisks mounts removable drives under /run/media/<user> (Debian-style
+	// systems use /media/<user>); the user name matches the home directory.
+	for _, parent := range []string{filepath.Join("/run/media", filepath.Base(home)), filepath.Join("/media", filepath.Base(home))} {
+		for _, mount := range mountedMediaDirs(parent) {
+			appendDir(mount)
+		}
+	}
+	appendDir(home)
+	return dirs
 }
 
+// mountedMediaDirs lists each mounted drive directly below base; the drives
+// themselves are searched recursively later, like any other root.
+func mountedMediaDirs(base string) []string {
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+	var dirs []string
+	for _, entry := range entries {
+		if entry.IsDir() {
+			dirs = append(dirs, filepath.Join(base, entry.Name()))
+		}
+	}
+	return dirs
+}
+
+// locateOriginalFile recovers the on-disk path of a dropped file. The
+// freedesktop recent-documents list is consulted first because it records
+// exact paths — resolving drops from anywhere, including places the
+// directory search would never reach — and only then are the likely
+// directories searched by name and size.
 func locateOriginalFile(name string, size int64) string {
+	if path := locateRecentFile(recentlyUsedPath(), name, size); path != "" {
+		return path
+	}
 	return locateFileIn(dropSearchDirs(), name, size)
 }
 
+// recentlyUsedPath is the freedesktop shared recent-documents list. GTK
+// applications have always written it, and KDE joined with Frameworks 5.93,
+// so it covers both desktop families without extra dependencies.
+func recentlyUsedPath() string {
+	if data := os.Getenv("XDG_DATA_HOME"); data != "" {
+		return filepath.Join(data, "recently-used.xbel")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".local", "share", "recently-used.xbel")
+}
+
+// locateRecentFile scans an XBEL recent-documents list for a bookmark whose
+// base name and current on-disk size match the dropped file. Later entries
+// are more recent, so the list is read backwards and the copy the user
+// touched last wins.
+func locateRecentFile(xbelPath, name string, size int64) string {
+	base := sanitizeDropName(name)
+	if base == "" || size <= 0 || xbelPath == "" {
+		return ""
+	}
+	// A pathologically large history must not stall the drop; the directory
+	// search still runs without this shortcut.
+	if info, err := os.Stat(xbelPath); err != nil || info.Size() > 16<<20 {
+		return ""
+	}
+	data, err := os.ReadFile(xbelPath)
+	if err != nil {
+		return ""
+	}
+	var document struct {
+		Bookmarks []struct {
+			Href string `xml:"href,attr"`
+		} `xml:"bookmark"`
+	}
+	if err := xml.Unmarshal(data, &document); err != nil {
+		return ""
+	}
+	for i := len(document.Bookmarks) - 1; i >= 0; i-- {
+		parsed, err := url.Parse(document.Bookmarks[i].Href)
+		if err != nil || parsed.Scheme != "file" || parsed.Path == "" {
+			continue
+		}
+		candidate := filepath.FromSlash(parsed.Path)
+		if filepath.Base(candidate) != base {
+			continue
+		}
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() && info.Size() == size {
+			return candidate
+		}
+	}
+	return ""
+}
+
+// The recursive pass of the drop search is bounded twice over: directories
+// more than dropSearchMaxDepth levels below a root are pruned, and all roots
+// share one wall-clock budget so /api/locate answers promptly even on
+// enormous drives. Past either bound the file is reported as not found,
+// exactly as before the recursive search existed.
+const (
+	dropSearchMaxDepth = 4
+	dropSearchBudget   = time.Second
+)
+
+// locateFileIn finds a file with the dropped file's base name and exact byte
+// size under dirs. The top level of every directory is checked first — one
+// stat each, and the overwhelmingly common drop source — so a top-level
+// match in a late root always beats a nested match in an early one; only
+// then is each root walked recursively in priority order.
 func locateFileIn(dirs []string, name string, size int64) string {
-	base := filepath.Base(strings.TrimSpace(name))
-	if base == "" || base == "." || base == "/" || size <= 0 {
+	base := sanitizeDropName(name)
+	if base == "" || size <= 0 {
 		return ""
 	}
 	for _, dir := range dirs {
@@ -104,7 +221,85 @@ func locateFileIn(dirs []string, name string, size int64) string {
 			return candidate
 		}
 	}
+	// Each root gets an equal share of the remaining budget, and roots that
+	// finish early donate their leftover time to the ones after them. A huge
+	// early root can therefore never starve the later ones — notably the
+	// removable drives, which sit behind the XDG folders.
+	deadline := time.Now().Add(dropSearchBudget)
+	for i, dir := range dirs {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if found := searchDirTree(dir, base, size, time.Now().Add(remaining/time.Duration(len(dirs)-i))); found != "" {
+			return found
+		}
+	}
 	return ""
+}
+
+// searchDirTree looks for base with the exact size below root, breadth
+// first: users drop files that sit a level or two down, and a depth-first
+// walk of a large drive would exhaust the budget inside whichever huge tree
+// happens to sort first. Hidden directories and well-known noise trees are
+// pruned, symlinked directories are not followed, and unreadable directories
+// are skipped rather than aborting: a permission error somewhere must not
+// hide a match elsewhere.
+func searchDirTree(root, base string, size int64, deadline time.Time) string {
+	type pending struct {
+		path  string
+		depth int
+	}
+	queue := []pending{{filepath.Clean(root), 0}}
+	for len(queue) > 0 {
+		if !time.Now().Before(deadline) {
+			return ""
+		}
+		dir := queue[0]
+		queue = queue[1:]
+		entries, err := os.ReadDir(dir.path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if entry.IsDir() {
+				if dir.depth < dropSearchMaxDepth && !skipDropSearchDir(name) {
+					queue = append(queue, pending{filepath.Join(dir.path, name), dir.depth + 1})
+				}
+				continue
+			}
+			if name != base || !entry.Type().IsRegular() {
+				continue
+			}
+			if info, err := entry.Info(); err == nil && info.Size() == size {
+				return filepath.Join(dir.path, name)
+			}
+		}
+	}
+	return ""
+}
+
+// skipDropSearchDir prunes trees that cannot plausibly hold a user's video:
+// hidden directories (which also covers .git and caches), dependency trees,
+// and Linux and Windows filesystem plumbing (external drives are frequently
+// NTFS-formatted).
+func skipDropSearchDir(name string) bool {
+	switch name {
+	case "node_modules", "lost+found", "$RECYCLE.BIN", "System Volume Information":
+		return true
+	}
+	return strings.HasPrefix(name, ".")
+}
+
+// sanitizeDropName reduces a client-supplied file name to its base name;
+// traversal segments must never influence where the search looks.
+func sanitizeDropName(name string) string {
+	base := filepath.Base(strings.TrimSpace(name))
+	if base == "." || base == "/" {
+		return ""
+	}
+	return base
 }
 
 func defaultOutputDir() string {
