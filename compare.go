@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 )
@@ -213,4 +214,55 @@ func planConversion(info VideoInfo, v compareVerdicts, p compareProfiles) (conve
 		return plan, nil
 	}
 	return convertPlan{}, fmt.Errorf("this browser cannot play any preview format")
+}
+
+// storyboardSpec fixes the sprite geometry for one output: Count evenly
+// spaced tiles, TileWidth matching the 192px hover box, laid out in Columns
+// columns. Interval is the seconds each tile represents.
+type storyboardSpec struct {
+	Count, Columns, Rows, TileWidth, TileHeight int
+	Interval                                    float64
+}
+
+// storyboardSpecFor aims for roughly one thumbnail per second, floored at 16
+// so short clips still scrub meaningfully and capped at 180 to bound sprite
+// size (~10x192 x 18xTileHeight worst case).
+func storyboardSpecFor(duration float64, width, height int) storyboardSpec {
+	count := int(math.Round(duration))
+	if count < 16 {
+		count = 16
+	}
+	if count > 180 {
+		count = 180
+	}
+	tileHeight := 108
+	if width > 0 && height > 0 {
+		tileHeight = int(math.Round(192*float64(height)/float64(width)/2)) * 2
+	}
+	return storyboardSpec{
+		Count:      count,
+		Columns:    10,
+		Rows:       (count + 9) / 10,
+		TileWidth:  192,
+		TileHeight: tileHeight,
+		Interval:   duration / float64(count),
+	}
+}
+
+// storyboardState is the manifest shared with the client; a zero value means
+// generation has not started.
+type storyboardState struct {
+	State      string  `json:"state"`
+	Interval   float64 `json:"interval"`
+	Count      int     `json:"count"`
+	Columns    int     `json:"columns"`
+	TileWidth  int     `json:"tileWidth"`
+	TileHeight int     `json:"tileHeight"`
+}
+
+// compareTimelineDuration is the seekable ceiling: clamped just short of the
+// shorter stream so a seek never lands past either side's end.
+func compareTimelineDuration(input, output float64) float64 {
+	duration := math.Min(input, output) - 0.05
+	return math.Max(0.1, math.Round(duration*1000)/1000)
 }

@@ -159,3 +159,39 @@ func TestPlanConversion(t *testing.T) {
 		})
 	}
 }
+
+func TestStoryboardSpecFor(t *testing.T) {
+	cases := []struct {
+		name               string
+		duration           float64
+		width, height      int
+		count, rows, tileH int
+	}{
+		{name: "one thumb per second for mid-length clips", duration: 84.2, width: 1920, height: 1080, count: 84, rows: 9, tileH: 108},
+		{name: "short clips keep a 16 thumb floor", duration: 3.4, width: 1920, height: 1080, count: 16, rows: 2, tileH: 108},
+		{name: "long videos cap at 180 thumbs", duration: 4000, width: 1280, height: 720, count: 180, rows: 18, tileH: 108},
+		{name: "portrait tiles stay 192 wide", duration: 30, width: 1080, height: 1920, count: 30, rows: 3, tileH: 342},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			spec := storyboardSpecFor(tc.duration, tc.width, tc.height)
+			if spec.Count != tc.count || spec.Rows != tc.rows || spec.TileHeight != tc.tileH ||
+				spec.Columns != 10 || spec.TileWidth != 192 {
+				t.Fatalf("storyboardSpecFor(%v, %d, %d) = %+v", tc.duration, tc.width, tc.height, spec)
+			}
+			wantInterval := tc.duration / float64(tc.count)
+			if diff := spec.Interval - wantInterval; diff > 1e-9 || diff < -1e-9 {
+				t.Fatalf("interval = %v, want %v", spec.Interval, wantInterval)
+			}
+		})
+	}
+}
+
+func TestCompareTimelineDuration(t *testing.T) {
+	if got := compareTimelineDuration(84.3, 84.25); got != 84.2 {
+		t.Fatalf("timeline duration = %v, want 84.2", got)
+	}
+	if got := compareTimelineDuration(0.05, 9); got != 0.1 {
+		t.Fatalf("tiny durations must clamp to 0.1, got %v", got)
+	}
+}
