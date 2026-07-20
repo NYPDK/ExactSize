@@ -7,8 +7,8 @@ A local Linux video compressor with one promise: the output is **never larger th
 ## Run it
 
 ```bash
-chmod +x ExactSize-1.8.29-x86_64.AppImage
-./ExactSize-1.8.29-x86_64.AppImage
+chmod +x ExactSize-1.9.0-x86_64.AppImage
+./ExactSize-1.9.0-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
