@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 )
@@ -108,4 +109,107 @@ func compareMime(info VideoInfo) sideMimes {
 	}
 	mimes.Full = container + `; codecs="` + full + `"`
 	return mimes
+}
+
+// compareScaleFilter caps converted previews at a 1920px longest edge with
+// even dimensions, matching the aspect-preserving idiom used elsewhere.
+const compareScaleFilter = "scale=w='min(1920,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+
+// compareVerdicts are the client's canPlayType results for one side's mimes;
+// compareProfiles say which candidate preview profiles the browser can play.
+type compareVerdicts struct {
+	Full  bool `json:"full"`
+	Video bool `json:"video"`
+	Audio bool `json:"audio"`
+}
+
+type compareProfiles struct {
+	H264MP4 bool `json:"h264mp4"`
+	VP9WebM bool `json:"vp9webm"`
+}
+
+// convertPlan is a declarative FFmpeg strategy for one converted preview.
+type convertPlan struct {
+	VideoArgs []string
+	AudioArgs []string
+	Filter    string
+	Container string
+}
+
+// mp4Video/webmVideo/mp4Audio/webmAudio say which codec copies are legal in
+// each preview container.
+var (
+	mp4CopyVideo  = map[string]bool{"h264": true, "h265": true, "av1": true}
+	webmCopyVideo = map[string]bool{"vp9": true, "av1": true}
+	mp4CopyAudio  = map[string]bool{"aac": true, "mp3": true, "opus": true}
+	webmCopyAudio = map[string]bool{"opus": true, "vorbis": true}
+)
+
+// planConversion picks the cheapest preview that the browser can play:
+// container remux when both codecs decode, an audio-only transcode when just
+// the audio is the problem, and a full video transcode otherwise.
+func planConversion(info VideoInfo, v compareVerdicts, p compareProfiles) (convertPlan, error) {
+	video := mapProbeCodec(info.VideoCodec)
+	audio := ""
+	if info.AudioTracks > 0 {
+		audio = mapProbeAudioCodec(info.AudioCodec)
+	}
+	hasAudio := info.AudioTracks > 0
+
+	if v.Video {
+		// The browser decodes the video codec, so never re-encode it; pick
+		// the container that legally carries the copy.
+		if mp4CopyVideo[video] {
+			if !hasAudio {
+				return convertPlan{VideoArgs: []string{"-c:v", "copy"}, AudioArgs: []string{"-an"}, Container: "mp4"}, nil
+			}
+			if v.Audio && mp4CopyAudio[audio] {
+				return convertPlan{VideoArgs: []string{"-c:v", "copy"}, AudioArgs: []string{"-c:a", "copy"}, Container: "mp4"}, nil
+			}
+			return convertPlan{VideoArgs: []string{"-c:v", "copy"}, AudioArgs: []string{"-c:a", "aac", "-b:a", "160k"}, Container: "mp4"}, nil
+		}
+		if webmCopyVideo[video] {
+			if !hasAudio {
+				return convertPlan{VideoArgs: []string{"-c:v", "copy"}, AudioArgs: []string{"-an"}, Container: "webm"}, nil
+			}
+			if v.Audio && webmCopyAudio[audio] {
+				return convertPlan{VideoArgs: []string{"-c:v", "copy"}, AudioArgs: []string{"-c:a", "copy"}, Container: "webm"}, nil
+			}
+			return convertPlan{VideoArgs: []string{"-c:v", "copy"}, AudioArgs: []string{"-c:a", "libopus", "-b:a", "128k"}, Container: "webm"}, nil
+		}
+	}
+
+	if p.H264MP4 {
+		plan := convertPlan{
+			VideoArgs: []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p"},
+			AudioArgs: []string{"-an"},
+			Filter:    compareScaleFilter,
+			Container: "mp4",
+		}
+		if hasAudio {
+			if v.Audio && mp4CopyAudio[audio] {
+				plan.AudioArgs = []string{"-c:a", "copy"}
+			} else {
+				plan.AudioArgs = []string{"-c:a", "aac", "-b:a", "160k"}
+			}
+		}
+		return plan, nil
+	}
+	if p.VP9WebM {
+		plan := convertPlan{
+			VideoArgs: []string{"-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "5", "-row-mt", "1", "-crf", "24", "-b:v", "0", "-pix_fmt", "yuv420p"},
+			AudioArgs: []string{"-an"},
+			Filter:    compareScaleFilter,
+			Container: "webm",
+		}
+		if hasAudio {
+			if v.Audio && webmCopyAudio[audio] {
+				plan.AudioArgs = []string{"-c:a", "copy"}
+			} else {
+				plan.AudioArgs = []string{"-c:a", "libopus", "-b:a", "128k"}
+			}
+		}
+		return plan, nil
+	}
+	return convertPlan{}, fmt.Errorf("this browser cannot play any preview format")
 }
