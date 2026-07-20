@@ -566,3 +566,102 @@ func (a *App) handleCompareOpen(w http.ResponseWriter, _ *http.Request) {
 		},
 	})
 }
+
+// compareMediaContentType maps a media file onto the Content-Type served to
+// the <video> element; http.ServeContent only sniffs when nothing is set.
+func compareMediaContentType(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mp4", ".m4v", ".mov":
+		return "video/mp4"
+	case ".webm":
+		return "video/webm"
+	case ".mkv":
+		return "video/x-matroska"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// handleCompareMedia serves the real input/output files (variant=source) or a
+// converted preview (variant=preview) with Range support, which is what gives
+// the viewer native, lag-free seeking.
+func (a *App) handleCompareMedia(w http.ResponseWriter, r *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+	assets := a.ensureCompareAssets(job)
+	side := r.PathValue("side")
+	path, ok := assets.sidePath(side)
+	if !ok {
+		writeError(w, http.StatusNotFound, "unknown comparison side")
+		return
+	}
+	if r.URL.Query().Get("variant") == "preview" {
+		convert := assets.convertSnapshot(side)
+		if convert.State != "ready" || convert.path == "" {
+			writeError(w, http.StatusNotFound, "no converted preview is ready for this side")
+			return
+		}
+		path = convert.path
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "the comparison file no longer exists")
+		return
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", compareMediaContentType(path))
+	http.ServeContent(w, r, "", stat.ModTime(), file)
+}
+
+// handleCompareStoryboard serves the hover sprite once it is ready; a plain
+// image endpoint (rather than a base64 blob in the manifest) lets the browser
+// cache the sprite and fetch it only once a hover actually needs it.
+func (a *App) handleCompareStoryboard(w http.ResponseWriter, r *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+	assets := a.ensureCompareAssets(job)
+	assets.mu.Lock()
+	ready := assets.story.State == "ready"
+	sprite := filepath.Join(assets.dir, "storyboard.jpg")
+	hasDir := assets.dir != ""
+	assets.mu.Unlock()
+	if !ready || !hasDir {
+		writeError(w, http.StatusNotFound, "the hover storyboard is not ready yet")
+		return
+	}
+	file, err := os.Open(sprite)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "the hover storyboard is not ready yet")
+		return
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	http.ServeContent(w, r, "", stat.ModTime(), file)
+}
+
+// handleCompareStoryboardManifest reports storyboard geometry and readiness;
+// the client polls it while generation runs.
+func (a *App) handleCompareStoryboardManifest(w http.ResponseWriter, _ *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+	writeJSON(w, http.StatusOK, a.ensureCompareAssets(job).storyboardSnapshot())
+}

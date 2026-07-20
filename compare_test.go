@@ -423,3 +423,80 @@ func TestCompareOpenReportsSidesStoryboardAndPreviews(t *testing.T) {
 	}
 	job.request.Remux = false
 }
+
+func TestCompareMediaServesRangesWithQueryToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	app := newApp(fakeCompareFFmpeg(t, dir), fakeCompareFFprobe(t, dir), "secret", fstest.MapFS{})
+	job := completedCompareJob(t, dir)
+	app.job = job
+	t.Cleanup(app.teardownCompareAssets)
+	handler := app.routes()
+
+	get := func(path string, header http.Header) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		for key, values := range header {
+			req.Header[key] = values
+		}
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	if got := get("/api/compare/media/output?variant=source", nil); got.Code != http.StatusForbidden {
+		t.Fatalf("media without token returned %d, want 403", got.Code)
+	}
+	full := get("/api/compare/media/output?variant=source&token=secret", nil)
+	if full.Code != http.StatusOK || full.Body.String() != "media-bytes" {
+		t.Fatalf("media = %d %q", full.Code, full.Body.String())
+	}
+	if got := full.Header().Get("Content-Type"); got != "video/mp4" {
+		t.Fatalf("media Content-Type = %q, want video/mp4", got)
+	}
+	if got := full.Header().Get("Accept-Ranges"); got != "bytes" {
+		t.Fatalf("media Accept-Ranges = %q, want bytes", got)
+	}
+	ranged := get("/api/compare/media/output?variant=source&token=secret",
+		http.Header{"Range": []string{"bytes=2-5"}})
+	if ranged.Code != http.StatusPartialContent || ranged.Body.String() != "dia-" {
+		t.Fatalf("ranged media = %d %q, want 206 \"dia-\"", ranged.Code, ranged.Body.String())
+	}
+	if got := get("/api/compare/media/output?variant=preview&token=secret", nil); got.Code != http.StatusNotFound {
+		t.Fatalf("missing preview returned %d, want 404", got.Code)
+	}
+	if got := get("/api/compare/media/elsewhere?variant=source&token=secret", nil); got.Code != http.StatusNotFound {
+		t.Fatalf("unknown side returned %d, want 404", got.Code)
+	}
+
+	if got := get("/api/compare/storyboard?token=secret", nil); got.Code != http.StatusNotFound {
+		t.Fatalf("storyboard before generation returned %d, want 404", got.Code)
+	}
+	assets := app.ensureCompareAssets(job)
+	previewDir, err := assets.ensureDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(previewDir, "storyboard.jpg"), []byte("jpegdata"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	assets.mu.Lock()
+	assets.story = storyboardState{State: "ready", Interval: 1, Count: 30, Columns: 10, TileWidth: 192, TileHeight: 108}
+	assets.mu.Unlock()
+	sprite := get("/api/compare/storyboard?token=secret", nil)
+	if sprite.Code != http.StatusOK || sprite.Body.String() != "jpegdata" {
+		t.Fatalf("storyboard = %d %q", sprite.Code, sprite.Body.String())
+	}
+	if got := sprite.Header().Get("Content-Type"); got != "image/jpeg" {
+		t.Fatalf("storyboard Content-Type = %q", got)
+	}
+	manifest := get("/api/compare/storyboard/manifest", http.Header{"X-Exactsize-Token": []string{"secret"}})
+	if manifest.Code != http.StatusOK || !strings.Contains(manifest.Body.String(), `"ready"`) {
+		t.Fatalf("manifest = %d %q", manifest.Code, manifest.Body.String())
+	}
+
+	job.request.Remux = true
+	if got := get("/api/compare/media/output?variant=source&token=secret", nil); got.Code != http.StatusConflict {
+		t.Fatalf("remux media returned %d, want 409", got.Code)
+	}
+	job.request.Remux = false
+}
