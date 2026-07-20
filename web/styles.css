@@ -240,6 +240,49 @@ html.frameless .app-header {
   background: var(--danger);
 }
 
+.update-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  margin-left: 12px;
+  color: var(--accent);
+  background: var(--selected-bg);
+  border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border));
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .01em;
+  transition: background-color 150ms ease, border-color 150ms ease, transform 150ms ease;
+}
+
+.update-button:hover {
+  color: var(--accent-hover);
+  background: var(--surface-hover);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.update-button:active {
+  transform: translateY(0);
+}
+
+.update-button svg {
+  width: 13px;
+  height: 13px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.update-button strong {
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+}
+
 .icon-button {
   display: inline-grid;
   place-items: center;

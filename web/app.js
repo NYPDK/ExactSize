@@ -9,6 +9,8 @@ const elements = {
   appVersion: $("appVersion"),
   runtimeStatus: $("runtimeStatus"),
   runtimeLabel: $("runtimeLabel"),
+  updateButton: $("updateButton"),
+  updateVersion: $("updateVersion"),
   themeColor: $("themeColor"),
   themeToggle: $("themeToggle"),
   minimizeButton: $("minimizeButton"),
@@ -162,6 +164,7 @@ async function initialize() {
     updateSizePresetSelection();
     setRuntime("Ready", "ready");
     updateFormState();
+    void checkForUpdates();
   } catch (error) {
     setRuntime("FFmpeg error", "error");
     showError(error);
@@ -180,6 +183,36 @@ function applyTheme(theme) {
 
 function toggleTheme() {
   applyTheme(document.documentElement.dataset.theme === "light" ? "dark" : "light");
+}
+
+async function checkForUpdates() {
+  try {
+    const update = await api("/api/update/check");
+    if (!update.updateAvailable) return;
+    showUpdateAvailable(update.latestVersion);
+  } catch {
+    // Update checks are opportunistic; offline use must stay fully functional.
+  }
+}
+
+function showUpdateAvailable(latestVersion) {
+  const label = `v${latestVersion}`;
+  elements.updateVersion.textContent = label;
+  elements.updateButton.setAttribute("aria-label", `Update available: ExactSize ${label}. Open the GitHub release page.`);
+  elements.updateButton.title = `Open the ExactSize ${label} release page`;
+  elements.updateButton.hidden = false;
+}
+
+async function openUpdateRelease() {
+  elements.updateButton.disabled = true;
+  try {
+    await api("/api/update/open", { method: "POST" });
+    showToast(`Opened the ${elements.updateVersion.textContent} release page`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    elements.updateButton.disabled = false;
+  }
 }
 
 const resolutionLadder = [2160, 1440, 1080, 720, 540, 480, 360];
@@ -417,6 +450,7 @@ function bindEvents() {
   elements.remuxButton.addEventListener("click", startRemux);
   elements.cancelButton.addEventListener("click", cancelCompression);
   elements.showOutputButton.addEventListener("click", showOutput);
+  elements.updateButton.addEventListener("click", openUpdateRelease);
   elements.themeToggle.addEventListener("click", toggleTheme);
   elements.quitButton.addEventListener("click", quitApplication);
   elements.errorDismiss.addEventListener("click", clearError);

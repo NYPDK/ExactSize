@@ -37,6 +37,10 @@ type App struct {
 	job      *Job
 	shutdown func()
 	uploads  []string
+
+	updateClient  *http.Client
+	releaseAPIURL string
+	openURL       func(string) error
 }
 
 type AppStatus struct {
@@ -328,7 +332,15 @@ type dialogResponse struct {
 }
 
 func newApp(ffmpeg, ffprobe, token string, web fs.FS) *App {
-	return &App{ffmpeg: ffmpeg, ffprobe: ffprobe, token: token, web: web}
+	return &App{
+		ffmpeg:        ffmpeg,
+		ffprobe:       ffprobe,
+		token:         token,
+		web:           web,
+		updateClient:  defaultUpdateClient(),
+		releaseAPIURL: exactSizeLatestReleaseAPI,
+		openURL:       openExternalURL,
+	}
 }
 
 func (a *App) routes() http.Handler {
@@ -338,6 +350,8 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /app.js", a.staticHandler())
 	mux.Handle("GET /icon.svg", a.staticHandler())
 	mux.HandleFunc("GET /api/status", a.auth(a.handleStatus))
+	mux.HandleFunc("GET /api/update/check", a.auth(a.handleUpdateCheck))
+	mux.HandleFunc("POST /api/update/open", a.auth(a.handleUpdateOpen))
 	mux.HandleFunc("POST /api/dialog/open", a.auth(a.handleOpenDialog))
 	mux.HandleFunc("POST /api/dialog/save", a.auth(a.handleSaveDialog))
 	mux.HandleFunc("POST /api/upload", a.auth(a.handleUpload))
