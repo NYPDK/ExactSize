@@ -1,11 +1,15 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestCompareMime(t *testing.T) {
@@ -353,4 +357,69 @@ func TestEnsureCompareAssetsTearsDownStaleJob(t *testing.T) {
 	if _, err := os.Stat(oldDir); !os.IsNotExist(err) {
 		t.Fatalf("ensureCompareAssets left the stale job's preview dir behind: %v", err)
 	}
+}
+
+// fakeCompareFFprobe answers every probe with a fixed h264+aac 1080p30 file.
+func fakeCompareFFprobe(t *testing.T, dir string) string {
+	t.Helper()
+	script := `#!/bin/sh
+cat <<'JSON'
+{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"aac","channels":2,"sample_rate":"48000"}],"format":{"duration":"30.000000","size":"1000","format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}
+JSON
+`
+	path := filepath.Join(dir, "ffprobe")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestCompareOpenReportsSidesStoryboardAndPreviews(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	app := newApp(fakeCompareFFmpeg(t, dir), fakeCompareFFprobe(t, dir), "secret", fstest.MapFS{})
+	job := completedCompareJob(t, dir)
+	app.job = job
+	t.Cleanup(app.teardownCompareAssets)
+	handler := app.routes()
+
+	call := func(authenticated bool) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/compare/open", strings.NewReader("{}"))
+		if authenticated {
+			req.Header.Set("X-ExactSize-Token", "secret")
+		}
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+	if got := call(false); got.Code != http.StatusForbidden {
+		t.Fatalf("unauthenticated open returned %d, want 403", got.Code)
+	}
+	response := call(true)
+	if response.Code != http.StatusOK {
+		t.Fatalf("open returned %d: %s", response.Code, response.Body.String())
+	}
+	var payload compareOpenResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Duration != 29.95 {
+		t.Fatalf("timeline duration = %v, want 29.95", payload.Duration)
+	}
+	output, ok := payload.Sides["output"]
+	if !ok || !strings.Contains(output.Full, "avc1.64002A") || !output.HasAudio || output.Width != 1920 {
+		t.Fatalf("output side = %+v", output)
+	}
+	if payload.Previews["input"].State != "none" || payload.Previews["output"].State != "none" {
+		t.Fatalf("previews = %+v", payload.Previews)
+	}
+	if payload.Storyboard.State == "" {
+		t.Fatalf("storyboard manifest missing: %+v", payload.Storyboard)
+	}
+
+	job.request.Remux = true
+	if got := call(true); got.Code != http.StatusConflict {
+		t.Fatalf("remux open returned %d, want 409", got.Code)
+	}
+	job.request.Remux = false
 }

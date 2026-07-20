@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -352,6 +353,7 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/jobs", a.auth(a.handleStartJob))
 	mux.HandleFunc("GET /api/jobs/current", a.auth(a.handleCurrentJob))
 	mux.HandleFunc("DELETE /api/jobs/current", a.auth(a.handleCancelJob))
+	mux.HandleFunc("POST /api/compare/open", a.auth(a.handleCompareOpen))
 	mux.HandleFunc("GET /api/compare/frame/{side}", a.auth(a.handleCompareFrame))
 	mux.HandleFunc("POST /api/reveal", a.auth(a.handleReveal))
 	mux.HandleFunc("POST /api/window/{action}", a.auth(a.handleWindowAction))
@@ -376,6 +378,22 @@ func securityHeaders(next http.Handler) http.Handler {
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("X-ExactSize-Token") != a.token {
+			writeError(w, http.StatusForbidden, "invalid application session")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// authMedia also accepts the session token as a query parameter: <video> and
+// background-image requests cannot attach custom headers.
+func (a *App) authMedia(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		token := r.Header.Get("X-ExactSize-Token")
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		if subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) != 1 {
 			writeError(w, http.StatusForbidden, "invalid application session")
 			return
 		}

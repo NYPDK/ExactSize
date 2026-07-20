@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -495,4 +496,73 @@ func (c *compareAssets) storyboardSnapshot() storyboardState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.story
+}
+
+// compareSideInfo is one side's playability facts for the viewer: the
+// canPlayType inputs plus the metadata the player needs before loadedmetadata.
+type compareSideInfo struct {
+	sideMimes
+	HasAudio bool    `json:"hasAudio"`
+	Width    int     `json:"width"`
+	Height   int     `json:"height"`
+	Duration float64 `json:"duration"`
+}
+
+// compareOpenResponse is the viewer's single bootstrap payload: both sides'
+// playability facts, the storyboard manifest, and any converted-preview
+// state, so opening the comparison view never needs a second round trip.
+type compareOpenResponse struct {
+	Duration   float64                    `json:"duration"`
+	Sides      map[string]compareSideInfo `json:"sides"`
+	Storyboard storyboardState            `json:"storyboard"`
+	Previews   map[string]convertState    `json:"previews"`
+}
+
+// convertSnapshot copies one side's conversion state for JSON responses.
+func (c *compareAssets) convertSnapshot(side string) convertState {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if convert := c.converts[side]; convert != nil {
+		return *convert
+	}
+	return convertState{State: "none"}
+}
+
+// handleCompareOpen is the viewer's single bootstrap call: cached probes for
+// both sides, the storyboard manifest, and any converted previews that
+// already exist, so a reopened viewer is instant.
+func (a *App) handleCompareOpen(w http.ResponseWriter, r *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+	assets := a.ensureCompareAssets(job)
+	sides := map[string]compareSideInfo{}
+	for _, side := range []string{"input", "output"} {
+		info, err := assets.sideProbe(a.ffprobe, side)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		sides[side] = compareSideInfo{
+			sideMimes: compareMime(info),
+			HasAudio:  info.AudioTracks > 0,
+			Width:     info.Width,
+			Height:    info.Height,
+			Duration:  info.Duration,
+		}
+	}
+	// The storyboard normally starts right after the encode; opening the
+	// viewer is the fallback trigger (a restart or an early open).
+	go assets.generateStoryboard(a.ffmpeg)
+	writeJSON(w, http.StatusOK, compareOpenResponse{
+		Duration:   compareTimelineDuration(sides["input"].Duration, sides["output"].Duration),
+		Sides:      sides,
+		Storyboard: assets.storyboardSnapshot(),
+		Previews: map[string]convertState{
+			"input":  assets.convertSnapshot("input"),
+			"output": assets.convertSnapshot("output"),
+		},
+	})
 }
