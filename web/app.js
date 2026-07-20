@@ -1322,11 +1322,17 @@ function previewCompareTimeline(event) {
   elements.compareHoverTime.textContent = formatDuration(seconds);
   elements.compareHoverPreview.hidden = false;
   const story = compare.storyboard;
-  if (compare.storyboardImage && story?.state === "ready" && story.interval > 0) {
+  if (compare.storyboardImage && story?.state === "ready" && story.interval > 0 && story.tileWidth > 0) {
     const index = Math.min(story.count - 1, Math.floor(seconds / story.interval));
     const column = index % story.columns;
     const row = Math.floor(index / story.columns);
-    elements.compareHoverThumb.style.backgroundPosition = `${-column * story.tileWidth}px ${-row * story.tileHeight}px`;
+    // The hover stage is padded narrower than the sprite's native tile size, so
+    // scale the whole sprite to the measured box instead of using raw offsets.
+    const stageWidth = elements.compareHoverStage.clientWidth || story.tileWidth;
+    const scale = stageWidth / story.tileWidth;
+    const rows = Math.ceil(story.count / story.columns);
+    elements.compareHoverThumb.style.backgroundSize = `${story.columns * story.tileWidth * scale}px ${rows * story.tileHeight * scale}px`;
+    elements.compareHoverThumb.style.backgroundPosition = `${-column * story.tileWidth * scale}px ${-row * story.tileHeight * scale}px`;
     elements.compareHoverPreview.classList.remove("loading");
   } else {
     elements.compareHoverPreview.classList.add("loading");

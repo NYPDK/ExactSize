@@ -151,6 +151,7 @@ func TestCompletedCompressionOffersLargeSynchronizedComparison(t *testing.T) {
 		"requestAnimationFrame",
 		".currentTime = master.currentTime",
 		"backgroundPosition",
+		"backgroundSize",
 		`addEventListener("ended"`,
 		`addEventListener("pointermove", previewCompareTimeline)`,
 		`addEventListener("pointerleave", hideCompareHoverPreview)`,
