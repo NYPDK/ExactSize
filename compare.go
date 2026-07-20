@@ -115,14 +115,15 @@ func compareMime(info VideoInfo) sideMimes {
 // even dimensions, matching the aspect-preserving idiom used elsewhere.
 const compareScaleFilter = "scale=w='min(1920,iw)':h='min(1920,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
 
-// compareVerdicts are the client's canPlayType results for one side's mimes;
-// compareProfiles say which candidate preview profiles the browser can play.
+// compareVerdicts are the client's canPlayType results for one side's mimes.
 type compareVerdicts struct {
 	Full  bool `json:"full"`
 	Video bool `json:"video"`
 	Audio bool `json:"audio"`
 }
 
+// compareProfiles report which candidate preview profiles — H.264+AAC MP4,
+// VP9+Opus WebM — the client's browser can play.
 type compareProfiles struct {
 	H264MP4 bool `json:"h264mp4"`
 	VP9WebM bool `json:"vp9webm"`
@@ -136,8 +137,8 @@ type convertPlan struct {
 	Container string
 }
 
-// mp4Video/webmVideo/mp4Audio/webmAudio say which codec copies are legal in
-// each preview container.
+// mp4CopyVideo/webmCopyVideo/mp4CopyAudio/webmCopyAudio say which codec
+// copies are legal in each preview container.
 var (
 	mp4CopyVideo  = map[string]bool{"h264": true, "h265": true, "av1": true}
 	webmCopyVideo = map[string]bool{"vp9": true, "av1": true}
