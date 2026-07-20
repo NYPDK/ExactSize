@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -664,4 +665,157 @@ func (a *App) handleCompareStoryboardManifest(w http.ResponseWriter, _ *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, a.ensureCompareAssets(job).storyboardSnapshot())
+}
+
+// startConvert begins (or reports) one side's preview conversion. It is
+// idempotent so reopening the viewer resumes polling instead of re-encoding.
+func (c *compareAssets) startConvert(ffmpeg, side string, info VideoInfo, v compareVerdicts, p compareProfiles) convertState {
+	c.mu.Lock()
+	convert := c.converts[side]
+	if convert == nil {
+		convert = &convertState{State: "none"}
+		c.converts[side] = convert
+	}
+	if convert.State == "converting" || convert.State == "ready" {
+		snapshot := *convert
+		c.mu.Unlock()
+		return snapshot
+	}
+	plan, err := planConversion(info, v, p)
+	if err != nil {
+		convert.State = "failed"
+		convert.Error = err.Error()
+		snapshot := *convert
+		c.mu.Unlock()
+		return snapshot
+	}
+	convert.State = "converting"
+	convert.Progress = 0
+	convert.Error = ""
+	snapshot := *convert
+	c.mu.Unlock()
+	go c.runConvert(ffmpeg, side, info, plan)
+	return snapshot
+}
+
+// runConvert executes the planned FFmpeg command, reporting progress from the
+// -progress stream. The output goes to the job's preview directory, so the
+// media endpoint can serve it the moment the state flips to ready.
+func (c *compareAssets) runConvert(ffmpeg, side string, info VideoInfo, plan convertPlan) {
+	fail := func(detail string) {
+		c.mu.Lock()
+		convert := c.converts[side]
+		convert.State = "failed"
+		convert.Error = detail
+		c.mu.Unlock()
+	}
+	dir, err := c.ensureDir()
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	output := filepath.Join(dir, "preview-"+side+"."+plan.Container)
+	args := []string{"-hide_banner", "-nostdin", "-loglevel", "error", "-i", info.Path, "-map", "0:v:0"}
+	dropAudio := len(plan.AudioArgs) == 1 && plan.AudioArgs[0] == "-an"
+	if !dropAudio {
+		args = append(args, "-map", "0:a:0?")
+	}
+	args = append(args, "-sn", "-dn")
+	if plan.Filter != "" {
+		args = append(args, "-vf", plan.Filter)
+	}
+	args = append(args, plan.VideoArgs...)
+	args = append(args, plan.AudioArgs...)
+	if plan.Container == "mp4" {
+		args = append(args, "-movflags", "+faststart")
+	}
+	args = append(args, "-progress", "pipe:1", "-nostats", "-f", muxerName(plan.Container), "-y", output)
+
+	command := exec.CommandContext(c.ctx, ffmpeg, args...)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		fail(err.Error())
+		return
+	}
+	var stderr limitedBuffer
+	command.Stderr = &stderr
+	if err := command.Start(); err != nil {
+		fail(err.Error())
+		return
+	}
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		key, value, found := strings.Cut(scanner.Text(), "=")
+		if !found {
+			continue
+		}
+		if seconds, ok := progressSeconds(key, value, 0); ok && info.Duration > 0 {
+			progress := math.Min(1, seconds/info.Duration)
+			c.mu.Lock()
+			c.converts[side].Progress = progress
+			c.mu.Unlock()
+		}
+	}
+	if err := command.Wait(); err != nil {
+		if c.ctx.Err() != nil {
+			return
+		}
+		detail := strings.TrimSpace(stderr.String())
+		if detail == "" {
+			detail = err.Error()
+		}
+		fail(detail)
+		return
+	}
+	c.mu.Lock()
+	convert := c.converts[side]
+	convert.State = "ready"
+	convert.Progress = 1
+	convert.path = output
+	c.mu.Unlock()
+}
+
+// handleCompareConvertStart validates the request and kicks the conversion.
+func (a *App) handleCompareConvertStart(w http.ResponseWriter, r *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+	var request struct {
+		Side     string          `json:"side"`
+		Verdicts compareVerdicts `json:"verdicts"`
+		Profiles compareProfiles `json:"profiles"`
+	}
+	if err := decodeJSON(r, &request); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	assets := a.ensureCompareAssets(job)
+	if _, ok := assets.sidePath(request.Side); !ok {
+		writeError(w, http.StatusNotFound, "unknown comparison side")
+		return
+	}
+	info, err := assets.sideProbe(a.ffprobe, request.Side)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, assets.startConvert(a.ffmpeg, request.Side, info, request.Verdicts, request.Profiles))
+}
+
+// handleCompareConvertStatus reports one side's conversion progress.
+func (a *App) handleCompareConvertStatus(w http.ResponseWriter, r *http.Request) {
+	job, status, message := a.currentComparisonJob()
+	if job == nil {
+		writeError(w, status, message)
+		return
+	}
+	assets := a.ensureCompareAssets(job)
+	side := r.PathValue("side")
+	if _, ok := assets.sidePath(side); !ok {
+		writeError(w, http.StatusNotFound, "unknown comparison side")
+		return
+	}
+	writeJSON(w, http.StatusOK, assets.convertSnapshot(side))
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 )
 
 func TestCompareMime(t *testing.T) {
@@ -499,4 +500,86 @@ func TestCompareMediaServesRangesWithQueryToken(t *testing.T) {
 		t.Fatalf("remux media returned %d, want 409", got.Code)
 	}
 	job.request.Remux = false
+}
+
+func TestCompareConvertLifecycle(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	callLog := filepath.Join(dir, "convert-calls")
+	t.Setenv("EXACTSIZE_COMPARE_TEST_LOG", callLog)
+	app := newApp(fakeCompareFFmpeg(t, dir), fakeCompareFFprobe(t, dir), "secret", fstest.MapFS{})
+	job := completedCompareJob(t, dir)
+	app.job = job
+	t.Cleanup(app.teardownCompareAssets)
+	handler := app.routes()
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("X-ExactSize-Token", "secret")
+		handler.ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	// An unplayable side converts; the fake ffmpeg finishes instantly.
+	start := request(http.MethodPost, "/api/compare/convert",
+		`{"side":"output","verdicts":{"full":false,"video":false,"audio":true},"profiles":{"h264mp4":true,"vp9webm":true}}`)
+	if start.Code != http.StatusAccepted {
+		t.Fatalf("convert start returned %d: %s", start.Code, start.Body.String())
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var status convertState
+	for {
+		response := request(http.MethodGet, "/api/compare/convert/output", "")
+		if response.Code != http.StatusOK {
+			t.Fatalf("convert status returned %d", response.Code)
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &status); err != nil {
+			t.Fatal(err)
+		}
+		if status.State == "ready" || status.State == "failed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("conversion never finished: %+v", status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if status.State != "ready" || status.Progress != 1 {
+		t.Fatalf("conversion state = %+v, want ready/1", status)
+	}
+	args, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"libx264", "-crf", "18", "-movflags", "+faststart", "preview-output.mp4", "-progress"} {
+		if !strings.Contains(string(args), expected) {
+			t.Errorf("convert FFmpeg args missing %q:\n%s", expected, args)
+		}
+	}
+	preview := request(http.MethodGet, "/api/compare/media/output?variant=preview", "")
+	if preview.Code != http.StatusOK || preview.Body.Len() == 0 {
+		t.Fatalf("converted preview = %d %q", preview.Code, preview.Body.String())
+	}
+	if got := preview.Header().Get("Content-Type"); got != "video/mp4" {
+		t.Fatalf("converted preview Content-Type = %q", got)
+	}
+
+	// Starting again is idempotent: the ready state comes straight back.
+	again := request(http.MethodPost, "/api/compare/convert",
+		`{"side":"output","verdicts":{},"profiles":{}}`)
+	if again.Code != http.StatusAccepted || !strings.Contains(again.Body.String(), `"ready"`) {
+		t.Fatalf("repeat convert = %d %s", again.Code, again.Body.String())
+	}
+
+	// A browser with no playable profile fails fast with a clear error.
+	failed := request(http.MethodPost, "/api/compare/convert",
+		`{"side":"input","verdicts":{},"profiles":{}}`)
+	if failed.Code != http.StatusAccepted || !strings.Contains(failed.Body.String(), `"failed"`) {
+		t.Fatalf("unplayable convert = %d %s", failed.Code, failed.Body.String())
+	}
+
+	if got := request(http.MethodPost, "/api/compare/convert", `{"side":"elsewhere"}`); got.Code != http.StatusNotFound {
+		t.Fatalf("unknown convert side returned %d, want 404", got.Code)
+	}
 }

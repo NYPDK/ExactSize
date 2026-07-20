@@ -358,6 +358,8 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("GET /api/compare/media/{side}", a.authMedia(a.handleCompareMedia))
 	mux.HandleFunc("GET /api/compare/storyboard", a.authMedia(a.handleCompareStoryboard))
 	mux.HandleFunc("GET /api/compare/storyboard/manifest", a.auth(a.handleCompareStoryboardManifest))
+	mux.HandleFunc("POST /api/compare/convert", a.auth(a.handleCompareConvertStart))
+	mux.HandleFunc("GET /api/compare/convert/{side}", a.auth(a.handleCompareConvertStatus))
 	mux.HandleFunc("POST /api/reveal", a.auth(a.handleReveal))
 	mux.HandleFunc("POST /api/window/{action}", a.auth(a.handleWindowAction))
 	mux.HandleFunc("POST /api/quit", a.auth(a.handleQuit))
