@@ -80,6 +80,9 @@ type sideMimes struct {
 	Optimistic bool   `json:"optimistic"`
 }
 
+// compareMime assembles one side's three canPlayType inputs: the source
+// container MIME deciding direct playback, plus per-codec target-container
+// MIMEs that feed the conversion verdict chain.
 func compareMime(info VideoInfo) sideMimes {
 	container, optimistic := compareContainerMime(info.Path)
 	videoCodec, videoTarget := compareVideoCodecString(info.VideoCodec, info.PixelFormat)
