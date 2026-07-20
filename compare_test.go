@@ -188,10 +188,19 @@ func TestStoryboardSpecFor(t *testing.T) {
 }
 
 func TestCompareTimelineDuration(t *testing.T) {
-	if got := compareTimelineDuration(84.3, 84.25); got != 84.2 {
-		t.Fatalf("timeline duration = %v, want 84.2", got)
+	cases := []struct {
+		name          string
+		input, output float64
+		want          float64
+	}{
+		{name: "normal case: take min and subtract fudge", input: 84.3, output: 84.25, want: 84.2},
+		{name: "tiny durations must clamp to 0.1", input: 0.05, output: 9, want: 0.1},
 	}
-	if got := compareTimelineDuration(0.05, 9); got != 0.1 {
-		t.Fatalf("tiny durations must clamp to 0.1, got %v", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := compareTimelineDuration(tc.input, tc.output); got != tc.want {
+				t.Fatalf("compareTimelineDuration(%v, %v) = %v, want %v", tc.input, tc.output, got, tc.want)
+			}
+		})
 	}
 }
