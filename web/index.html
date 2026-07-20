@@ -270,10 +270,6 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/></svg>
             Cancel
           </button>
-          <button class="secondary-button" id="compareButton" type="button" hidden>
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M8 7l-4 5 4 5M16 7l4 5-4 5"/></svg>
-            Compare
-          </button>
           <button class="secondary-button" id="showOutputButton" type="button" hidden>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3V7z"/></svg>
             Show output
@@ -281,52 +277,6 @@
         </div>
       </section>
     </main>
-  </div>
-
-  <div class="compare-overlay" id="compareOverlay" hidden>
-    <section class="compare-dialog" role="dialog" aria-modal="true" aria-labelledby="compareTitle" aria-describedby="compareHint">
-      <header class="compare-header">
-        <div>
-          <span class="eyeline">Visual comparison</span>
-          <h2 id="compareTitle">Original vs compressed</h2>
-        </div>
-        <button class="icon-button" id="compareClose" type="button" aria-label="Close comparison" title="Close comparison">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
-        </button>
-      </header>
-
-      <div class="compare-stage" id="compareStage">
-        <video class="compare-frame compare-original" id="compareOriginalVideo" muted playsinline preload="auto"></video>
-        <video class="compare-frame compare-compressed" id="compareCompressedVideo" playsinline preload="auto"></video>
-        <span class="compare-label compare-label-original">Original</span>
-        <span class="compare-label compare-label-compressed">Compressed</span>
-        <span class="compare-divider" aria-hidden="true"></span>
-        <input class="compare-split-control" id="compareSlider" type="range" min="0" max="100" step="1" value="50" aria-label="Comparison divider position">
-        <span class="compare-loading" id="compareLoading" role="status">Loading video previews…</span>
-      </div>
-
-      <footer class="compare-controls" id="compareControls">
-        <button class="icon-button compare-play" id="comparePlay" type="button" aria-label="Play or pause" title="Play or pause" disabled>
-          <svg class="play-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5l11 7-11 7V5z"/></svg>
-          <svg class="pause-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5h4v14H7zM13 5h4v14h-4z"/></svg>
-        </button>
-        <button class="icon-button compare-mute" id="compareMute" type="button" aria-label="Mute or unmute" title="Mute audio" disabled>
-          <svg class="sound-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16.5 8.5a5 5 0 010 7"/></svg>
-          <svg class="muted-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M16 9l5 6M21 9l-5 6"/></svg>
-        </button>
-        <div class="compare-timeline-wrap" id="compareTimelineWrap">
-          <div class="compare-hover-preview" id="compareHoverPreview" aria-hidden="true" hidden>
-            <div class="compare-hover-stage" id="compareHoverStage">
-              <div class="compare-hover-thumb" id="compareHoverThumb"></div>
-            </div>
-            <output class="compare-hover-time" id="compareHoverTime">00:00</output>
-          </div>
-          <input class="compare-timeline" id="compareTimeline" type="range" min="0" max="1000" step="1" value="0" aria-label="Playback position" disabled>
-        </div>
-        <output class="compare-time" id="compareTime" for="compareTimeline">00:00 / 00:00</output>
-        <span class="compare-hint" id="compareHint">Play or scrub the timeline · hover for an instant preview.</span>
-      </footer>
-    </section>
   </div>
 
   <div class="confirm-overlay" id="confirmOverlay" hidden>

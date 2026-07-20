@@ -37,10 +37,7 @@ type App struct {
 	job      *Job
 	shutdown func()
 	uploads  []string
-	compare  *compareAssets
 }
-
-const comparePreviewPrefix = "exactsize-compare-"
 
 type AppStatus struct {
 	Version          string        `json:"version"`
@@ -331,7 +328,6 @@ type dialogResponse struct {
 }
 
 func newApp(ffmpeg, ffprobe, token string, web fs.FS) *App {
-	cleanupStaleComparePreviews()
 	return &App{ffmpeg: ffmpeg, ffprobe: ffprobe, token: token, web: web}
 }
 
@@ -350,12 +346,6 @@ func (a *App) routes() http.Handler {
 	mux.HandleFunc("POST /api/jobs", a.auth(a.handleStartJob))
 	mux.HandleFunc("GET /api/jobs/current", a.auth(a.handleCurrentJob))
 	mux.HandleFunc("DELETE /api/jobs/current", a.auth(a.handleCancelJob))
-	mux.HandleFunc("POST /api/compare/open", a.auth(a.handleCompareOpen))
-	mux.HandleFunc("GET /api/compare/media/{side}", a.authMedia(a.handleCompareMedia))
-	mux.HandleFunc("GET /api/compare/storyboard", a.authMedia(a.handleCompareStoryboard))
-	mux.HandleFunc("GET /api/compare/storyboard/manifest", a.auth(a.handleCompareStoryboardManifest))
-	mux.HandleFunc("POST /api/compare/convert", a.auth(a.handleCompareConvertStart))
-	mux.HandleFunc("GET /api/compare/convert/{side}", a.auth(a.handleCompareConvertStatus))
 	mux.HandleFunc("POST /api/reveal", a.auth(a.handleReveal))
 	mux.HandleFunc("POST /api/window/{action}", a.auth(a.handleWindowAction))
 	mux.HandleFunc("POST /api/quit", a.auth(a.handleQuit))
@@ -379,22 +369,6 @@ func securityHeaders(next http.Handler) http.Handler {
 func (a *App) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-ExactSize-Token")
-		if subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) != 1 {
-			writeError(w, http.StatusForbidden, "invalid application session")
-			return
-		}
-		next(w, r)
-	}
-}
-
-// authMedia also accepts the session token as a query parameter: <video> and
-// background-image requests cannot attach custom headers.
-func (a *App) authMedia(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token := r.Header.Get("X-ExactSize-Token")
-		if token == "" {
-			token = r.URL.Query().Get("token")
-		}
 		if subtle.ConstantTimeCompare([]byte(token), []byte(a.token)) != 1 {
 			writeError(w, http.StatusForbidden, "invalid application session")
 			return
@@ -560,8 +534,6 @@ func (a *App) handleStartJob(w http.ResponseWriter, r *http.Request) {
 		request.VAAPIDevice = a.vaapiDevices[request.Encoder]
 	}
 
-	a.teardownCompareAssets()
-
 	a.mu.Lock()
 	if a.job != nil && !a.job.isTerminal() {
 		a.mu.Unlock()
@@ -572,10 +544,7 @@ func (a *App) handleStartJob(w http.ResponseWriter, r *http.Request) {
 	a.job = job
 	a.mu.Unlock()
 
-	go func() {
-		job.run(a.ffmpeg, a.ffprobe)
-		a.prepareCompareAssets(job)
-	}()
+	go job.run(a.ffmpeg, a.ffprobe)
 	writeJSON(w, http.StatusAccepted, job.snapshot())
 }
 
@@ -588,20 +557,6 @@ func (a *App) handleCurrentJob(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job.snapshot())
-}
-
-func (a *App) currentComparisonJob() (*Job, int, string) {
-	a.mu.RLock()
-	job := a.job
-	a.mu.RUnlock()
-	if job == nil {
-		return nil, http.StatusNotFound, "no completed compression is available to compare"
-	}
-	snapshot := job.snapshot()
-	if snapshot.State != "completed" || job.request.Remux || job.request.MuxAudio {
-		return nil, http.StatusConflict, "comparison is available only after a successful compression"
-	}
-	return job, 0, ""
 }
 
 func (a *App) handleCancelJob(w http.ResponseWriter, _ *http.Request) {
@@ -627,25 +582,6 @@ func (a *App) cancelCurrentJob() {
 	}
 	for _, path := range uploads {
 		_ = os.Remove(path)
-	}
-	a.teardownCompareAssets()
-}
-
-func cleanupStaleComparePreviews() {
-	directories, _ := filepath.Glob(filepath.Join(os.TempDir(), comparePreviewPrefix+"*"))
-	for _, dir := range directories {
-		name := strings.TrimPrefix(filepath.Base(dir), comparePreviewPrefix)
-		pidText, _, found := strings.Cut(name, "-")
-		if pid, err := strconv.Atoi(pidText); found && err == nil {
-			if processIsRunning(pid) {
-				continue
-			}
-			_ = os.RemoveAll(dir)
-			continue
-		}
-		if info, err := os.Stat(dir); err == nil && time.Since(info.ModTime()) > 24*time.Hour {
-			_ = os.RemoveAll(dir)
-		}
 	}
 }
 
