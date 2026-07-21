@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCalculateVideoBitrateBudgetsAudioAndOverhead(t *testing.T) {
@@ -436,6 +439,19 @@ func TestLikelyAV1VAAPIBitrateFloor(t *testing.T) {
 	}
 }
 
+func TestNeedsTimeBoundedHardwareProjection(t *testing.T) {
+	info := VideoInfo{Width: 1920, Height: 1080, FPS: 23.98}
+	if !needsTimeBoundedHardwareProjection(EncodeRequest{}, info, 82) {
+		t.Fatal("the feature-length 82 kbps case should use a time-bounded projection")
+	}
+	if needsTimeBoundedHardwareProjection(EncodeRequest{}, info, 4_000) {
+		t.Fatal("an ordinary 1080p hardware bitrate should keep the conservative checkpoint")
+	}
+	if !needsTimeBoundedHardwareProjection(EncodeRequest{}, VideoInfo{Width: 3840, Height: 2160, FPS: 60}, 1_500) {
+		t.Fatal("a very low bits-per-pixel 4K request should use a time-bounded projection")
+	}
+}
+
 func TestCorrectionHitBitrateFloor(t *testing.T) {
 	if !correctionHitBitrateFloor(400, 520, 300, 515, 380) {
 		t.Fatal("a 100 kbps request cut with only a 5 kbps output response should confirm a bitrate floor")
@@ -487,6 +503,228 @@ func TestBitrateCorrectionMessageNamesEveryChangedValue(t *testing.T) {
 	}
 }
 
+func TestOutputSizeMonitorStopsImmediatelyAfterCrossingTarget(t *testing.T) {
+	monitor := newOutputSizeMonitor(100, 100_000_000, false)
+	decision := monitor.observe(12, 100_000_001, 12)
+	if decision == nil || !decision.ExceededTarget {
+		t.Fatalf("crossing the target should stop the attempt immediately, got %+v", decision)
+	}
+	if decision.CurrentBytes != 100_000_001 || decision.EncodedFraction != 0.12 {
+		t.Fatalf("unexpected immediate-stop measurements: %+v", decision)
+	}
+	if decision := newOutputSizeMonitor(100, 100_000_000, false).observe(100, 100_000_001, 100); decision != nil {
+		t.Fatalf("a completed attempt should be verified normally instead of killed: %+v", decision)
+	}
+}
+
+func TestOutputSizeMonitorProjectsTrajectoryAtTwentyFivePercent(t *testing.T) {
+	monitor := newOutputSizeMonitor(100, 100_000_000, false)
+	for _, sample := range []struct {
+		seconds float64
+		bytes   int64
+	}{
+		{10, 15_000_000},
+		{15, 22_500_000},
+		{20, 30_000_000},
+		{25, 37_500_000},
+	} {
+		decision := monitor.observe(sample.seconds, sample.bytes, sample.seconds)
+		if sample.seconds < 25 && decision != nil {
+			t.Fatalf("projection fired before 25%%: %+v", decision)
+		}
+		if sample.seconds == 25 {
+			if decision == nil || decision.ExceededTarget {
+				t.Fatalf("a projected 150 MB output should stop at 25%%, got %+v", decision)
+			}
+			if decision.ProjectedBytes != 150_000_000 || decision.EncodedFraction != 0.25 {
+				t.Fatalf("unexpected projection: %+v", decision)
+			}
+		}
+	}
+}
+
+func TestHardwareOutputSizeMonitorUsesTimeBoundedCheckpoint(t *testing.T) {
+	monitor := newOutputSizeMonitor(90*60, 100_000_000, true)
+	for _, seconds := range []float64{10, 15, 20, 25, 30} {
+		// A 1 MB fixed header plus 30 KB/s projects to 163 MB: far enough
+		// above target to be conclusive from a short opening sample.
+		decision := monitor.observe(seconds, 1_000_000+int64(seconds*30_000), seconds)
+		if seconds < 30 && decision != nil {
+			t.Fatalf("time-bounded projection fired before 30 encoded seconds: %+v", decision)
+		}
+		if seconds == 30 {
+			if decision == nil || decision.ProjectedBytes != 163_000_000 {
+				t.Fatalf("long hardware encode should be stopped at 30 encoded seconds, got %+v", decision)
+			}
+			if decision.EncodedFraction >= 0.01 {
+				t.Fatalf("the decision should happen well before 1%% of a feature-length source: %+v", decision)
+			}
+		}
+	}
+}
+
+func TestHardwareOutputSizeMonitorCapsSlowAttemptWallTime(t *testing.T) {
+	monitor := newOutputSizeMonitor(90*60, 100_000_000, true)
+	samples := []struct {
+		encoded float64
+		wall    float64
+	}{
+		{5, 30},
+		{7, 40},
+		{9, 50},
+		{11, 60},
+	}
+	for _, sample := range samples {
+		decision := monitor.observe(sample.encoded, 1_000_000+int64(sample.encoded*30_000), sample.wall)
+		if sample.wall < 60 && decision != nil {
+			t.Fatalf("wall-time projection fired before the bounded checkpoint: %+v", decision)
+		}
+		if sample.wall == 60 && (decision == nil || decision.ProjectedBytes != 163_000_000) {
+			t.Fatalf("slow hardware attempt should be stopped after one minute of evidence, got %+v", decision)
+		}
+	}
+}
+
+func TestHardwareOutputSizeMonitorAllowsFeasibleOpeningSpike(t *testing.T) {
+	monitor := newOutputSizeMonitor(90*60, 200_000_000, true)
+	for _, seconds := range []float64{5, 10, 15, 20, 25, 30} {
+		// The opening projects to 220 MB, but that 10% miss is normal content
+		// variation from only 30 seconds of a 90-minute movie. It must not be
+		// treated as proof that a 200 MB full encode is impossible.
+		if decision := monitor.observe(seconds, 1_000_000+int64(seconds*40_555.5556), seconds); decision != nil {
+			t.Fatalf("short feasible opening spike should keep encoding, got %+v", decision)
+		}
+	}
+	if got := monitor.projectedBytes(); got < 219_999_000 || got > 220_001_000 {
+		t.Fatalf("opening projection = %d, want about 220000000", got)
+	}
+}
+
+func TestHardwareOutputConfidenceTightensWithCoverage(t *testing.T) {
+	monitor := newOutputSizeMonitor(90*60, 200_000_000, true)
+	for _, test := range []struct {
+		seconds float64
+		want    float64
+	}{
+		{30, 0.30},
+		{810, 0.30},
+		{1080, 0.10},
+		{1350, 0.02},
+	} {
+		got := monitor.confidenceMarginRatio(test.seconds)
+		if got < test.want-0.0001 || got > test.want+0.0001 {
+			t.Fatalf("confidence margin at %.0f seconds = %.4f, want %.4f", test.seconds, got, test.want)
+		}
+	}
+}
+
+func TestOutputSizeMonitorKeepsOnTrackAttempt(t *testing.T) {
+	monitor := newOutputSizeMonitor(100, 100_000_000, false)
+	for _, sample := range []struct {
+		seconds float64
+		bytes   int64
+	}{
+		// The fixed 5 MB mux/header cost should be modeled as an intercept,
+		// leaving an 85 MB final projection instead of scaling 25 MB by 4.
+		{10, 13_000_000},
+		{15, 17_000_000},
+		{20, 21_000_000},
+		{25, 25_000_000},
+	} {
+		if decision := monitor.observe(sample.seconds, sample.bytes, sample.seconds); decision != nil {
+			t.Fatalf("an on-track attempt should continue, got %+v", decision)
+		}
+	}
+	if got := monitor.projectedBytes(); got != 85_000_000 {
+		t.Fatalf("header-aware projection = %d, want 85000000", got)
+	}
+}
+
+func TestEarlyCorrectionContextExplainsProjection(t *testing.T) {
+	message := earlyCorrectionContext(&earlySizeCorrectionError{
+		ProjectedBytes:  150_000_000,
+		EncodedFraction: 0.25,
+	}, 100_000_000)
+	for _, detail := range []string{"25%", "150.0 MB", "100.0 MB target"} {
+		if !strings.Contains(message, detail) {
+			t.Fatalf("early correction message %q is missing %q", message, detail)
+		}
+	}
+}
+
+func TestEarlySizeCorrectionCancelsCleansAndRetries(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "input.mp4")
+	output := filepath.Join(tempDir, "output.mp4")
+	if err := os.WriteFile(input, []byte("fake input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ffprobe := filepath.Join(tempDir, "fake-ffprobe")
+	probeDocument := `{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","pix_fmt":"yuv420p"}],"format":{"duration":"10","size":"10","format_name":"mov,mp4"}}`
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s\\n' '"+probeDocument+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	attemptFile := filepath.Join(tempDir, "attempt")
+	t.Setenv("EXACTSIZE_TEST_ATTEMPT_FILE", attemptFile)
+	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
+	ffmpegScript := `#!/bin/sh
+attempt=0
+if [ -f "$EXACTSIZE_TEST_ATTEMPT_FILE" ]; then
+  read attempt < "$EXACTSIZE_TEST_ATTEMPT_FILE"
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$EXACTSIZE_TEST_ATTEMPT_FILE"
+for output do :; done
+if [ "$attempt" -eq 1 ]; then
+  truncate -s 12000000 "$output"
+  printf 'out_time_us=1000000\n'
+  exec sleep 10
+fi
+if [ -e "$output" ]; then
+  printf 'partial output still existed when retry started\n' >&2
+  exit 42
+fi
+truncate -s 9000000 "$output"
+printf 'out_time_us=10000000\nprogress=end\n'
+`
+	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	request := validTestRequest()
+	request.Input = input
+	request.Output = output
+	request.TargetBytes = 10_000_000
+	request.AudioCodec = "none"
+	request.AudioBitrateKbps = 0
+	request.TwoPass = false
+	job := newJob(request)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	job.ctx = ctx
+	job.cancel = cancel
+
+	if err := job.runEncode(ffmpeg, ffprobe); err != nil {
+		t.Fatalf("early correction run failed: %v", err)
+	}
+	status := job.snapshot()
+	if status.State != "completed" || status.Attempt != 2 {
+		t.Fatalf("expected a completed second attempt, got %+v", status)
+	}
+	if stat, err := os.Stat(output); err != nil || stat.Size() != 9_000_000 {
+		t.Fatalf("published retry output = %v, %v; want 9000000 bytes", stat, err)
+	}
+	workDirs, err := filepath.Glob(filepath.Join(tempDir, ".exactsize-work-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(workDirs) != 0 {
+		t.Fatalf("correction work directory was not cleaned up: %v", workDirs)
+	}
+}
+
 func TestRunFFmpegPreservesUsefulCorrectionMessage(t *testing.T) {
 	tempDir := t.TempDir()
 	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
@@ -495,7 +733,7 @@ func TestRunFFmpegPreservesUsefulCorrectionMessage(t *testing.T) {
 	}
 	job := newJob(validTestRequest())
 	job.status.Message = bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 30)
-	if err := job.runFFmpeg(ffmpeg, nil, 1, 30, 1, 1, 2, filepath.Join(tempDir, "output.webm")); err != nil {
+	if err := job.runFFmpeg(ffmpeg, nil, 1, 30, 1, 1, 2, filepath.Join(tempDir, "output.webm"), 0, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := job.snapshot().Message; got != bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 30) {
@@ -518,6 +756,11 @@ func TestHardwareCorrection(t *testing.T) {
 	// No excess: the encoder honored the request; not an additive miss.
 	if retry, hopeless := hardwareCorrection(3128, 3003, 2950); retry != 0 || hopeless {
 		t.Error("an honored request must fall back to proportional correction")
+	}
+	// A calculated correction just above the 64 kbps floor should snap to the
+	// floor instead of spending another long attempt on a negligible step.
+	if retry, hopeless := hardwareCorrection(79, 79, 90); retry != minimumVideoBitrateKbps || hopeless {
+		t.Fatalf("near-minimum hardware correction = %d, %v; want 64, false", retry, hopeless)
 	}
 }
 
@@ -627,6 +870,86 @@ func TestValidateAudioBitrateMinimums(t *testing.T) {
 	}
 }
 
+func TestOpusKeepSourceNormalizesMultichannelLayouts(t *testing.T) {
+	request := EncodeRequest{AudioCodec: "opus", AudioBitrateKbps: 64, AudioChannels: "source"}
+	info := VideoInfo{audioStreams: []audioStreamInfo{
+		{Channels: 6, ChannelLayout: "5.1(side)"},
+		{Channels: 2, ChannelLayout: "stereo"},
+		{Channels: 4, ChannelLayout: "3.1"},
+	}}
+	args := audioEncoderArgs(request, info)
+	for _, pair := range [][2]string{
+		{"-filter:a:0", "aformat=channel_layouts=5.1"},
+		{"-mapping_family:a:0", "1"},
+		{"-mapping_family:a:2", "255"},
+	} {
+		if !adjacentArgs(args, pair[0], pair[1]) {
+			t.Fatalf("Opus arguments are missing %q %q: %v", pair[0], pair[1], args)
+		}
+	}
+	for _, forbidden := range []string{"-filter:a:1", "-mapping_family:a:1"} {
+		if slices.Contains(args, forbidden) {
+			t.Fatalf("stereo stream must not receive %s: %v", forbidden, args)
+		}
+	}
+
+	request.AudioChannels = "stereo"
+	args = audioEncoderArgs(request, info)
+	if !adjacentArgs(args, "-ac", "2") || slices.Contains(args, "-mapping_family:a:0") {
+		t.Fatalf("explicit stereo downmix should use only -ac 2: %v", args)
+	}
+}
+
+func adjacentArgs(args []string, key, value string) bool {
+	for index := 0; index+1 < len(args); index++ {
+		if args[index] == key && args[index+1] == value {
+			return true
+		}
+	}
+	return false
+}
+
+func TestOpusFivePointOneSideIntegration(t *testing.T) {
+	ffmpeg := testTool(t, "EXACTSIZE_TEST_FFMPEG", "ffmpeg")
+	ffprobe := testTool(t, "EXACTSIZE_TEST_FFPROBE", "ffprobe")
+	directory := t.TempDir()
+	input := filepath.Join(directory, "surround-input.mkv")
+	create := exec.Command(ffmpeg,
+		"-hide_banner", "-y", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=2:duration=0.5",
+		"-f", "lavfi", "-i", "anullsrc=channel_layout=5.1(side):sample_rate=48000",
+		"-t", "0.5", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "ac3", input,
+	)
+	if output, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("create 5.1(side) input: %v\n%s", err, output)
+	}
+	info, err := probeVideo(t.Context(), ffprobe, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AudioChannels != 6 || info.AudioChannelLayout != "5.1(side)" {
+		t.Fatalf("probed audio = %d channels, %q", info.AudioChannels, info.AudioChannelLayout)
+	}
+
+	output := filepath.Join(directory, "surround-output.webm")
+	args := []string{"-hide_banner", "-y", "-loglevel", "error", "-i", input, "-map", "0:a?"}
+	args = append(args, audioEncoderArgs(EncodeRequest{AudioCodec: "opus", AudioBitrateKbps: 64, AudioChannels: "source"}, info)...)
+	args = append(args, "-f", "webm", output)
+	if result, err := exec.Command(ffmpeg, args...).CombinedOutput(); err != nil {
+		t.Fatalf("encode 5.1(side) as Opus: %v\n%s", err, result)
+	}
+	probeOutput, err := exec.Command(ffprobe,
+		"-v", "error", "-select_streams", "a:0",
+		"-show_entries", "stream=channels,channel_layout", "-of", "csv=p=0", output,
+	).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(string(probeOutput)); got != "6,5.1" {
+		t.Fatalf("Opus output layout = %q, want 6,5.1", got)
+	}
+}
+
 func TestValidateRemuxRequest(t *testing.T) {
 	request := EncodeRequest{Input: "/tmp/in.mkv", Output: "/tmp/out.mp4", Container: "mp4", Remux: true}
 	if err := validateEncodeRequest(request); err != nil {
@@ -687,6 +1010,20 @@ func TestPassOneProgressUsesFrameFallback(t *testing.T) {
 	second := job.snapshot().Progress
 	if first != 22.5 || second != first {
 		t.Fatalf("progress moved backward: first=%v second=%v", first, second)
+	}
+}
+
+func TestRetryRemainingTimeUsesCurrentAttemptOnly(t *testing.T) {
+	job := newJob(validTestRequest())
+	job.started = time.Now().Add(-30 * time.Minute)
+	job.attemptStarted = time.Now().Add(-time.Minute)
+	job.updateProgress(5, 10, 1, 1, 8, "/nonexistent")
+	status := job.snapshot()
+	if status.ElapsedSeconds < 29*60 {
+		t.Fatalf("total elapsed time should include earlier attempts, got %.1f", status.ElapsedSeconds)
+	}
+	if status.RemainingSeconds < 50 || status.RemainingSeconds > 80 {
+		t.Fatalf("remaining time should use only the current attempt, got %.1f seconds", status.RemainingSeconds)
 	}
 }
 
@@ -793,6 +1130,46 @@ func outputSSIM(t *testing.T, ffmpeg, output, reference string) float64 {
 		t.Fatal(err)
 	}
 	return value
+}
+
+func TestFeasibleExtremeCompressionDoesNotFalseFail(t *testing.T) {
+	input := os.Getenv("EXACTSIZE_REAL_CONFIDENCE_INPUT")
+	if input == "" {
+		t.Skip("set EXACTSIZE_REAL_CONFIDENCE_INPUT to run the long-form hardware confidence regression")
+	}
+	ffmpeg := testTool(t, "EXACTSIZE_TEST_FFMPEG", "ffmpeg")
+	ffprobe := testTool(t, "EXACTSIZE_TEST_FFPROBE", "ffprobe")
+	device := os.Getenv("EXACTSIZE_TEST_VAAPI_DEVICE")
+	if device == "" {
+		device = "/dev/dri/renderD128"
+	}
+	request := EncodeRequest{
+		Input: input, Output: filepath.Join(t.TempDir(), "confidence.mp4"), TargetBytes: 200_000_000,
+		Container: "mp4", VideoCodec: "h265", Encoder: "hevc_vaapi", Preset: "balanced",
+		AudioCodec: "aac", AudioBitrateKbps: 64, AudioChannels: "source",
+		AutoResolution: true, MinimumOutputFPS: minimumOutputFPS, VAAPIDevice: device,
+	}
+	job := newJob(request)
+	done := make(chan error, 1)
+	go func() { done <- job.runEncode(ffmpeg, ffprobe) }()
+
+	timer := time.NewTimer(45 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("feasible 200 MB job false-failed during its confidence window: %v", err)
+		}
+	case <-timer.C:
+		status := job.snapshot()
+		job.cancel()
+		if err := <-done; !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancel confidence regression: %v", err)
+		}
+		if status.Attempt != 1 {
+			t.Fatalf("feasible opening was overcorrected into attempt %d: %+v", status.Attempt, status)
+		}
+	}
 }
 
 func TestRemuxIntegration(t *testing.T) {

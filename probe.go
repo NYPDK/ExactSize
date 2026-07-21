@@ -18,34 +18,42 @@ import (
 )
 
 type VideoInfo struct {
-	Path            string  `json:"path"`
-	Name            string  `json:"name"`
-	Size            int64   `json:"size"`
-	Duration        float64 `json:"duration"`
-	Width           int     `json:"width"`
-	Height          int     `json:"height"`
-	FPS             float64 `json:"fps"`
-	VideoCodec      string  `json:"videoCodec"`
-	PixelFormat     string  `json:"pixelFormat"`
-	AudioCodec      string  `json:"audioCodec"`
-	AudioChannels   int     `json:"audioChannels"`
-	AudioSampleRate int     `json:"audioSampleRate"`
-	AudioTracks     int     `json:"audioTracks"`
-	SubtitleTracks  int     `json:"subtitleTracks"`
-	Format          string  `json:"format"`
+	Path               string  `json:"path"`
+	Name               string  `json:"name"`
+	Size               int64   `json:"size"`
+	Duration           float64 `json:"duration"`
+	Width              int     `json:"width"`
+	Height             int     `json:"height"`
+	FPS                float64 `json:"fps"`
+	VideoCodec         string  `json:"videoCodec"`
+	PixelFormat        string  `json:"pixelFormat"`
+	AudioCodec         string  `json:"audioCodec"`
+	AudioChannels      int     `json:"audioChannels"`
+	AudioChannelLayout string  `json:"audioChannelLayout,omitempty"`
+	AudioSampleRate    int     `json:"audioSampleRate"`
+	AudioTracks        int     `json:"audioTracks"`
+	SubtitleTracks     int     `json:"subtitleTracks"`
+	Format             string  `json:"format"`
+	audioStreams       []audioStreamInfo
+}
+
+type audioStreamInfo struct {
+	Channels      int
+	ChannelLayout string
 }
 
 type ffprobeDocument struct {
 	Streams []struct {
-		CodecType    string `json:"codec_type"`
-		CodecName    string `json:"codec_name"`
-		Width        int    `json:"width"`
-		Height       int    `json:"height"`
-		RFrameRate   string `json:"r_frame_rate"`
-		AvgFrameRate string `json:"avg_frame_rate"`
-		PixelFormat  string `json:"pix_fmt"`
-		Channels     int    `json:"channels"`
-		SampleRate   string `json:"sample_rate"`
+		CodecType     string `json:"codec_type"`
+		CodecName     string `json:"codec_name"`
+		Width         int    `json:"width"`
+		Height        int    `json:"height"`
+		RFrameRate    string `json:"r_frame_rate"`
+		AvgFrameRate  string `json:"avg_frame_rate"`
+		PixelFormat   string `json:"pix_fmt"`
+		Channels      int    `json:"channels"`
+		ChannelLayout string `json:"channel_layout"`
+		SampleRate    string `json:"sample_rate"`
 	} `json:"streams"`
 	Format struct {
 		Duration   string `json:"duration"`
@@ -71,7 +79,7 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 	defer cancel()
 	command := exec.CommandContext(ctx, ffprobe,
 		"-v", "error",
-		"-show_entries", "format=duration,size,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,channels,sample_rate",
+		"-show_entries", "format=duration,size,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,channels,channel_layout,sample_rate",
 		"-of", "json",
 		path,
 	)
@@ -111,6 +119,10 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 			}
 		case "audio":
 			info.AudioTracks++
+			info.audioStreams = append(info.audioStreams, audioStreamInfo{
+				Channels:      stream.Channels,
+				ChannelLayout: stream.ChannelLayout,
+			})
 			sampleRate, _ := strconv.Atoi(stream.SampleRate)
 			if sampleRate > info.AudioSampleRate {
 				info.AudioSampleRate = sampleRate
@@ -118,6 +130,7 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 			if info.AudioCodec == "" {
 				info.AudioCodec = stream.CodecName
 				info.AudioChannels = stream.Channels
+				info.AudioChannelLayout = stream.ChannelLayout
 			}
 		case "subtitle":
 			info.SubtitleTracks++

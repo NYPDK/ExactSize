@@ -112,18 +112,228 @@ type Job struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 	started time.Time
+	// attemptStarted keeps retry ETA calculations independent from time spent
+	// in earlier failed attempts.
+	attemptStarted time.Time
 
 	mu     sync.RWMutex
 	status JobSnapshot
 }
 
+type outputSizeSample struct {
+	seconds float64
+	bytes   float64
+}
+
+type earlySizeCorrectionError struct {
+	CurrentBytes    int64
+	ProjectedBytes  int64
+	EncodedSeconds  float64
+	EncodedFraction float64
+	ExceededTarget  bool
+}
+
+func (err *earlySizeCorrectionError) Error() string {
+	if err.ExceededTarget {
+		return "partial output exceeded the target before the encode completed"
+	}
+	return "partial output trajectory is projected to exceed the target"
+}
+
+type outputSizeMonitor struct {
+	duration            float64
+	targetBytes         int64
+	sampleStartSeconds  float64
+	decisionSeconds     float64
+	minimumSampleSpan   float64
+	maximumDecisionWall float64
+	minimumMarginRatio  float64
+	earlyMarginRatio    float64
+	samples             []outputSizeSample
+}
+
+func newOutputSizeMonitor(duration float64, targetBytes int64, timeBounded bool) *outputSizeMonitor {
+	if duration <= 0 || targetBytes <= 0 {
+		return nil
+	}
+	monitor := &outputSizeMonitor{
+		duration:           duration,
+		targetBytes:        targetBytes,
+		sampleStartSeconds: duration * 0.10,
+		decisionSeconds:    duration * 0.25,
+		minimumSampleSpan:  duration * 0.05,
+		minimumMarginRatio: 0.02,
+	}
+	if timeBounded {
+		// Hardware rate control and its minimum-bitrate floors become clear
+		// quickly. Bound the checkpoint by encoded media time so a feature-length
+		// source does not have to reach 25% before a futile attempt is stopped.
+		monitor.sampleStartSeconds = min(monitor.sampleStartSeconds, 5)
+		monitor.decisionSeconds = min(monitor.decisionSeconds, 30)
+		monitor.minimumSampleSpan = min(monitor.minimumSampleSpan, 5)
+		monitor.maximumDecisionWall = 60
+		monitor.earlyMarginRatio = 0.30
+	}
+	return monitor
+}
+
+// observe records the growing output and decides whether the current attempt
+// can still fit. Crossing the ceiling before completion is always terminal for
+// the attempt. Software encodes use a 25% checkpoint. Hardware encodes cap the
+// checkpoint at 30 seconds of encoded media or about one minute of wall time,
+// so long and slow files do not spend many minutes proving a bitrate floor. A
+// least-squares trajectory separates fixed mux/header bytes from ongoing
+// stream growth.
+func (monitor *outputSizeMonitor) observe(encodedSeconds float64, encodedBytes int64, wallSeconds float64) *earlySizeCorrectionError {
+	if monitor == nil || encodedSeconds <= 0 || encodedBytes <= 0 {
+		return nil
+	}
+	fraction := math.Max(0, math.Min(1, encodedSeconds/monitor.duration))
+	if encodedBytes > monitor.targetBytes && fraction < 1 {
+		return &earlySizeCorrectionError{
+			CurrentBytes:    encodedBytes,
+			ProjectedBytes:  encodedBytes,
+			EncodedSeconds:  encodedSeconds,
+			EncodedFraction: fraction,
+			ExceededTarget:  true,
+		}
+	}
+	if fraction >= 1 {
+		return nil
+	}
+	if encodedSeconds < monitor.sampleStartSeconds {
+		return nil
+	}
+	if count := len(monitor.samples); count > 0 {
+		last := monitor.samples[count-1]
+		if encodedSeconds <= last.seconds || float64(encodedBytes) < last.bytes {
+			return nil
+		}
+	}
+	monitor.samples = append(monitor.samples, outputSizeSample{seconds: encodedSeconds, bytes: float64(encodedBytes)})
+	if len(monitor.samples) > 24 {
+		monitor.samples = monitor.samples[len(monitor.samples)-24:]
+	}
+	checkpointReached := encodedSeconds >= monitor.decisionSeconds
+	if monitor.maximumDecisionWall > 0 && wallSeconds >= monitor.maximumDecisionWall {
+		checkpointReached = true
+	}
+	if !checkpointReached || len(monitor.samples) < 4 {
+		return nil
+	}
+	first := monitor.samples[0]
+	if encodedSeconds-first.seconds < monitor.minimumSampleSpan {
+		return nil
+	}
+	projectedBytes := monitor.projectedBytes()
+	confidenceMargin := max(int64(float64(monitor.targetBytes)*monitor.confidenceMarginRatio(encodedSeconds)), int64(256<<10))
+	if projectedBytes <= monitor.targetBytes+confidenceMargin {
+		return nil
+	}
+	return &earlySizeCorrectionError{
+		CurrentBytes:    encodedBytes,
+		ProjectedBytes:  projectedBytes,
+		EncodedSeconds:  encodedSeconds,
+		EncodedFraction: fraction,
+	}
+}
+
+// confidenceMarginRatio reflects how representative the observed prefix can
+// be. A 30-second opening may legitimately run well above the movie's average,
+// so a time-bounded decision requires a clear miss. The allowance tightens as
+// coverage grows and reaches the normal 2% margin at 25%.
+func (monitor *outputSizeMonitor) confidenceMarginRatio(encodedSeconds float64) float64 {
+	if monitor == nil {
+		return 0
+	}
+	if monitor.earlyMarginRatio <= monitor.minimumMarginRatio || monitor.duration <= 0 {
+		return monitor.minimumMarginRatio
+	}
+	fraction := math.Max(0, math.Min(1, encodedSeconds/monitor.duration))
+	interpolate := func(value, from, to, start, end float64) float64 {
+		if value <= from {
+			return start
+		}
+		if value >= to {
+			return end
+		}
+		return start + (end-start)*(value-from)/(to-from)
+	}
+	switch {
+	case fraction <= 0.15:
+		return monitor.earlyMarginRatio
+	case fraction <= 0.20:
+		return interpolate(fraction, 0.15, 0.20, monitor.earlyMarginRatio, 0.10)
+	case fraction <= 0.25:
+		return interpolate(fraction, 0.20, 0.25, 0.10, monitor.minimumMarginRatio)
+	default:
+		return monitor.minimumMarginRatio
+	}
+}
+
+func (monitor *outputSizeMonitor) projectedBytes() int64 {
+	if monitor == nil || len(monitor.samples) < 2 {
+		return 0
+	}
+	var secondsMean, bytesMean float64
+	for _, sample := range monitor.samples {
+		secondsMean += sample.seconds
+		bytesMean += sample.bytes
+	}
+	secondsMean /= float64(len(monitor.samples))
+	bytesMean /= float64(len(monitor.samples))
+	var covariance, variance float64
+	for _, sample := range monitor.samples {
+		secondsDelta := sample.seconds - secondsMean
+		covariance += secondsDelta * (sample.bytes - bytesMean)
+		variance += secondsDelta * secondsDelta
+	}
+	if variance <= 0 {
+		return 0
+	}
+	slope := covariance / variance
+	if slope <= 0 {
+		return 0
+	}
+	intercept := bytesMean - slope*secondsMean
+	projected := intercept + slope*monitor.duration
+	lastBytes := monitor.samples[len(monitor.samples)-1].bytes
+	if projected < lastBytes {
+		projected = lastBytes
+	}
+	return int64(math.Ceil(projected))
+}
+
+func earlyCorrectionContext(correction *earlySizeCorrectionError, targetBytes int64) string {
+	if correction == nil || targetBytes <= 0 {
+		return ""
+	}
+	targetMB := float64(targetBytes) / 1_000_000
+	if correction.ExceededTarget {
+		return fmt.Sprintf("Stopped this attempt early because the partial output exceeded the %.1f MB target. ", targetMB)
+	}
+	percent := correction.EncodedFraction * 100
+	formattedPercent := fmt.Sprintf("%.0f%%", percent)
+	if percent < 10 {
+		formattedPercent = fmt.Sprintf("%.1f%%", percent)
+	}
+	return fmt.Sprintf(
+		"Stopped this attempt at %s because it was projected to finish at %.1f MB, above the %.1f MB target. ",
+		formattedPercent,
+		float64(correction.ProjectedBytes)/1_000_000,
+		targetMB,
+	)
+}
+
 func newJob(request EncodeRequest) *Job {
 	ctx, cancel := context.WithCancel(context.Background())
+	started := time.Now()
 	return &Job{
-		request: request,
-		ctx:     ctx,
-		cancel:  cancel,
-		started: time.Now(),
+		request:        request,
+		ctx:            ctx,
+		cancel:         cancel,
+		started:        started,
+		attemptStarted: started,
 		status: JobSnapshot{
 			State:       "queued",
 			Phase:       "Preparing",
@@ -251,9 +461,13 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		if err := j.ctx.Err(); err != nil {
 			return err
 		}
-		_ = os.Remove(tempOutput)
+		if err := removePartialOutput(tempOutput); err != nil {
+			return err
+		}
 		removePassLogs(passLog)
 		progressFPS := effectiveOutputFPS(j.request, info)
+		timeBoundedProjection := encoder.Hardware && needsTimeBoundedHardwareProjection(j.request, info, videoKbps)
+		j.attemptStarted = time.Now()
 
 		j.set(func(status *JobSnapshot) {
 			status.Attempt = attempt
@@ -262,39 +476,60 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			status.Progress = 0
 			status.Speed = ""
 			status.Error = ""
+			status.RemainingSeconds = 0
 			status.OutputFPS = progressFPS
 			status.Message = attemptMessage
 		})
 
+		var earlyCorrection *earlySizeCorrectionError
 		if useTwoPass {
 			firstPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, true)
-			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, progressFPS, 1, 2, attempt, tempOutput); err != nil {
+			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, progressFPS, 1, 2, attempt, tempOutput, 0, false); err != nil {
 				return err
 			}
 			secondPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 2, true)
-			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput); err != nil {
-				return err
+			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection); err != nil {
+				if !errors.As(err, &earlyCorrection) {
+					return err
+				}
 			}
 		} else {
 			args := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, false)
-			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput); err != nil {
-				return err
+			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection); err != nil {
+				if !errors.As(err, &earlyCorrection) {
+					return err
+				}
 			}
 		}
 
-		j.set(func(status *JobSnapshot) {
-			status.Phase = "Verifying"
-			status.Message = "Checking the exact output size…"
-			status.Progress = 99
-		})
-		stat, err := os.Stat(tempOutput)
-		if err != nil {
-			return errors.New("FFmpeg finished without creating an output file")
+		actualBytes := int64(0)
+		earlyContext := ""
+		if earlyCorrection != nil {
+			actualBytes = max(earlyCorrection.ProjectedBytes, earlyCorrection.CurrentBytes)
+			earlyContext = earlyCorrectionContext(earlyCorrection, j.request.TargetBytes)
+			if err := removePartialOutput(tempOutput); err != nil {
+				return err
+			}
+			j.set(func(status *JobSnapshot) {
+				status.Phase = "Correcting"
+				status.Message = earlyContext
+				status.EncodedBytes = 0
+			})
+		} else {
+			j.set(func(status *JobSnapshot) {
+				status.Phase = "Verifying"
+				status.Message = "Checking the exact output size…"
+				status.Progress = 99
+			})
+			stat, err := os.Stat(tempOutput)
+			if err != nil {
+				return errors.New("FFmpeg finished without creating an output file")
+			}
+			actualBytes = stat.Size()
+			j.set(func(status *JobSnapshot) { status.EncodedBytes = actualBytes })
 		}
-		actualBytes := stat.Size()
-		j.set(func(status *JobSnapshot) { status.EncodedBytes = actualBytes })
 
-		if actualBytes <= j.request.TargetBytes {
+		if earlyCorrection == nil && actualBytes <= j.request.TargetBytes {
 			if err := publishOutput(tempOutput, j.request.Output); err != nil {
 				return err
 			}
@@ -328,7 +563,11 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 
 		actualVideoKbps := measuredVideoKbps(actualBytes, info.Duration, info.AudioTracks, j.request.AudioCodec, j.request.AudioBitrateKbps)
 		availableVideoKbps := 0
-		if breakdown, probeErr := probeOutputBreakdown(j.ctx, ffprobe, tempOutput); probeErr != nil {
+		if earlyCorrection != nil {
+			// A deliberately killed output has no finalized index/trailer to
+			// probe. Its stable size trajectory still gives correction logic an
+			// effective delivered bitrate without waiting for the doomed pass.
+		} else if breakdown, probeErr := probeOutputBreakdown(j.ctx, ffprobe, tempOutput); probeErr != nil {
 			if j.ctx.Err() != nil {
 				return j.ctx.Err()
 			}
@@ -388,7 +627,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 					}
 					previousKbps := videoKbps
 					videoKbps = minimumKbps
-					attemptMessage = bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
+					attemptMessage = earlyContext + bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
 					j.set(func(status *JobSnapshot) {
 						status.Message = attemptMessage
 					})
@@ -399,7 +638,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 					j.request.OutputFPS = nextFPS
 					adaptiveFPSStage++
 					videoKbps = correctionBudgetKbps
-					attemptMessage = fmt.Sprintf(
+					attemptMessage = earlyContext + fmt.Sprintf(
 						"Bitrate options exhausted at %s fps; reducing frame rate to %s fps and restarting bitrate correction at %d kbps.",
 						formatFrameRate(previousFPS),
 						formatFrameRate(nextFPS),
@@ -424,7 +663,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 				j.request.ScaleWidth, j.request.ScaleHeight = width, height
 				videoKbps = correctionBudgetKbps
 				if fpsOptionsExhausted {
-					attemptMessage = fmt.Sprintf(
+					attemptMessage = earlyContext + fmt.Sprintf(
 						"Bitrate options exhausted at %s fps; reducing resolution from %d×%d to %d×%d and restarting bitrate correction at %d kbps.",
 						formatFrameRate(effectiveOutputFPS(j.request, info)),
 						previousWidth,
@@ -434,7 +673,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 						videoKbps,
 					)
 				} else {
-					attemptMessage = fmt.Sprintf(
+					attemptMessage = earlyContext + fmt.Sprintf(
 						"Bitrate options exhausted; reducing resolution from %d×%d to %d×%d and restarting bitrate correction at %d kbps.",
 						previousWidth,
 						previousHeight,
@@ -451,7 +690,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			if retryKbps > 0 {
 				previousKbps := videoKbps
 				videoKbps = retryKbps
-				attemptMessage = bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
+				attemptMessage = earlyContext + bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
 				j.set(func(status *JobSnapshot) {
 					status.Message = attemptMessage
 				})
@@ -469,7 +708,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			if videoKbps < minimumVideoBitrateKbps {
 				return errors.New("the target is too small for this duration and measured non-video overhead")
 			}
-			attemptMessage = bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
+			attemptMessage = earlyContext + bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
 			continue
 		}
 
@@ -480,10 +719,18 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		if videoKbps < minimumVideoBitrateKbps {
 			return errors.New("the target is too small for this duration and audio bitrate")
 		}
-		attemptMessage = bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
+		attemptMessage = earlyContext + bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
 	}
 
 	return errors.New("compression ended unexpectedly")
+}
+
+func removePartialOutput(path string) error {
+	err := os.Remove(path)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return fmt.Errorf("clean up incomplete output: %w", err)
 }
 
 // mapProbeAudioCodec normalizes an ffprobe audio codec name onto the app's
@@ -553,6 +800,7 @@ func (j *Job) runRemux(ffmpeg string, info VideoInfo) error {
 		status.Phase = "Remuxing"
 		status.Message = "Copying streams into the new container…"
 	})
+	j.attemptStarted = time.Now()
 
 	args := []string{
 		"-hide_banner", "-y", "-nostdin", "-loglevel", "error", "-stats_period", "0.25",
@@ -561,7 +809,7 @@ func (j *Job) runRemux(ffmpeg string, info VideoInfo) error {
 		"-c:v", "copy",
 	}
 	if j.request.MuxAudio {
-		args = append(args, audioEncoderArgs(j.request)...)
+		args = append(args, audioEncoderArgs(j.request, info)...)
 	} else {
 		args = append(args, "-c:a", "copy")
 	}
@@ -575,7 +823,7 @@ func (j *Job) runRemux(ffmpeg string, info VideoInfo) error {
 	}
 	args = append(args, "-progress", "pipe:1", "-nostats", "-f", muxerName(container), tempOutput)
 
-	if err := j.runFFmpeg(ffmpeg, args, info.Duration, info.FPS, 1, 1, 1, tempOutput); err != nil {
+	if err := j.runFFmpeg(ffmpeg, args, info.Duration, info.FPS, 1, 1, 1, tempOutput, 0, false); err != nil {
 		return err
 	}
 	stat, err := os.Stat(tempOutput)
@@ -600,7 +848,7 @@ func (j *Job) runRemux(ffmpeg string, info VideoInfo) error {
 	return nil
 }
 
-func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pass, passes, attempt int, output string) error {
+func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pass, passes, attempt int, output string, targetBytes int64, timeBoundedProjection bool) error {
 	phase := "Encoding"
 	if passes == 2 {
 		phase = fmt.Sprintf("Encoding pass %d of 2", pass)
@@ -623,6 +871,9 @@ func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pas
 		return fmt.Errorf("start FFmpeg: %w", err)
 	}
 
+	monitor := newOutputSizeMonitor(duration, targetBytes, timeBoundedProjection)
+	monitorStarted := time.Now()
+	var earlyCorrection *earlySizeCorrectionError
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		key, value, found := strings.Cut(scanner.Text(), "=")
@@ -630,34 +881,52 @@ func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pas
 			continue
 		}
 		if seconds, ok := progressSeconds(key, value, fps); ok {
-			j.updateProgress(seconds, duration, pass, passes, attempt, output)
+			encodedBytes := j.updateProgress(seconds, duration, pass, passes, attempt, output)
+			if earlyCorrection == nil && monitor != nil {
+				if decision := monitor.observe(seconds, encodedBytes, time.Since(monitorStarted).Seconds()); decision != nil {
+					earlyCorrection = decision
+					_ = command.Process.Kill()
+				}
+			}
 		}
 		switch key {
 		case "speed":
 			j.set(func(status *JobSnapshot) { status.Speed = strings.TrimSpace(value) })
 		}
 	}
-	if err := scanner.Err(); err != nil {
+	scanErr := scanner.Err()
+	if scanErr != nil {
 		_ = command.Process.Kill()
-		_ = command.Wait()
-		return err
 	}
-	if err := command.Wait(); err != nil {
+	waitErr := command.Wait()
+	if earlyCorrection != nil {
+		if j.ctx.Err() != nil {
+			return j.ctx.Err()
+		}
+		return earlyCorrection
+	}
+	if scanErr != nil {
+		if j.ctx.Err() != nil {
+			return j.ctx.Err()
+		}
+		return scanErr
+	}
+	if waitErr != nil {
 		if j.ctx.Err() != nil {
 			return j.ctx.Err()
 		}
 		detail := strings.TrimSpace(stderr.String())
 		if detail == "" {
-			detail = err.Error()
+			detail = waitErr.Error()
 		}
 		return fmt.Errorf("FFmpeg: %s", detail)
 	}
 	return nil
 }
 
-func (j *Job) updateProgress(encodedSeconds, duration float64, pass, passes, attempt int, output string) {
+func (j *Job) updateProgress(encodedSeconds, duration float64, pass, passes, attempt int, output string) int64 {
 	if duration <= 0 || encodedSeconds < 0 || math.IsNaN(encodedSeconds) || math.IsInf(encodedSeconds, 0) {
-		return
+		return 0
 	}
 	passFraction := math.Max(0, math.Min(1, encodedSeconds/duration))
 	overall := passFraction * 98
@@ -677,9 +946,10 @@ func (j *Job) updateProgress(encodedSeconds, duration float64, pass, passes, att
 		encodedBytes = stat.Size()
 	}
 	elapsed := time.Since(j.started).Seconds()
+	attemptElapsed := time.Since(j.attemptStarted).Seconds()
 	remaining := float64(0)
 	if overall > 0.5 {
-		remaining = math.Max(0, elapsed*(100-overall)/overall)
+		remaining = math.Max(0, attemptElapsed*(100-overall)/overall)
 	}
 	j.set(func(status *JobSnapshot) {
 		// FFmpeg can report a delayed timestamp after a newer frame count,
@@ -691,6 +961,7 @@ func (j *Job) updateProgress(encodedSeconds, duration float64, pass, passes, att
 		status.ElapsedSeconds = elapsed
 		status.RemainingSeconds = remaining
 	})
+	return encodedBytes
 }
 
 func buildFFmpegArgs(request EncodeRequest, info VideoInfo, videoKbps int, output, passLog string, pass int, twoPass bool) []string {
@@ -722,7 +993,7 @@ func buildFFmpegArgs(request EncodeRequest, info VideoInfo, videoKbps int, outpu
 		return args
 	}
 
-	args = append(args, audioEncoderArgs(request)...)
+	args = append(args, audioEncoderArgs(request, info)...)
 	args = append(args,
 		"-sn", "-dn",
 		"-map_metadata", "0", "-map_chapters", "0",
@@ -977,6 +1248,27 @@ func effectiveResolution(request EncodeRequest, info VideoInfo) (width, height i
 	return info.Width, info.Height
 }
 
+// needsTimeBoundedHardwareProjection identifies settings where the requested
+// rate is close enough to a GPU encoder floor that waiting for 25% would add
+// little confidence. Ordinary higher-bitrate hardware jobs keep the more
+// conservative percentage checkpoint so brief complex scenes cannot trigger
+// needless quality reductions.
+func needsTimeBoundedHardwareProjection(request EncodeRequest, info VideoInfo, videoKbps int) bool {
+	if videoKbps <= 0 {
+		return false
+	}
+	if videoKbps <= 256 {
+		return true
+	}
+	width, height := effectiveResolution(request, info)
+	fps := effectiveOutputFPS(request, info)
+	if width <= 0 || height <= 0 || fps <= 0 {
+		return false
+	}
+	bitsPerPixelFrame := float64(videoKbps*1000) / float64(width*height) / fps
+	return bitsPerPixelFrame <= 0.012
+}
+
 // encoderThreads caps the thread request; encoders gain little beyond 16 and
 // higher values only add memory pressure.
 func encoderThreads() int {
@@ -1147,6 +1439,13 @@ func hardwareCorrection(budgetKbps, requestedKbps, actualKbps int) (int, bool) {
 	if corrected < minimumVideoBitrateKbps || corrected*10 < budgetKbps*4 {
 		return 0, true
 	}
+	// Do not spend another long attempt testing a value only a few kbps above
+	// the encoder minimum. Probe the minimum directly; if it misses too, the
+	// next correction can move to the selected FPS or resolution fallback.
+	nearMinimum := max(8, budgetKbps/10)
+	if corrected <= minimumVideoBitrateKbps+nearMinimum {
+		return minimumVideoBitrateKbps, false
+	}
 	return corrected, false
 }
 
@@ -1179,7 +1478,7 @@ func floorAwareDownscale(sourceWidth, sourceHeight, currentHeight, actualKbps, b
 	return 0, 0, false
 }
 
-func audioEncoderArgs(request EncodeRequest) []string {
+func audioEncoderArgs(request EncodeRequest, info VideoInfo) []string {
 	if request.AudioCodec == "none" {
 		return []string{"-an"}
 	}
@@ -1192,8 +1491,50 @@ func audioEncoderArgs(request EncodeRequest) []string {
 		args = append(args, "-ac", "1")
 	case "stereo":
 		args = append(args, "-ac", "2")
+	case "source":
+		if request.AudioCodec == "opus" {
+			streams := info.audioStreams
+			if len(streams) == 0 && info.AudioChannels > 0 {
+				streams = []audioStreamInfo{{Channels: info.AudioChannels, ChannelLayout: info.AudioChannelLayout}}
+			}
+			for index, stream := range streams {
+				if stream.Channels <= 2 {
+					continue
+				}
+				layout, mappingFamily := opusLayoutMapping(stream.Channels, stream.ChannelLayout)
+				streamSpecifier := strconv.Itoa(index)
+				if layout != "" && layout != stream.ChannelLayout {
+					args = append(args, "-filter:a:"+streamSpecifier, "aformat=channel_layouts="+layout)
+				}
+				args = append(args, "-mapping_family:a:"+streamSpecifier, strconv.Itoa(mappingFamily))
+			}
+		}
 	}
 	return args
+}
+
+// opusLayoutMapping selects an explicit mapping for multichannel Opus. The
+// libopus default (-1) rejects common Blu-ray layouts such as 5.1(side).
+// Opus mapping family 1 defines interoperable surround layouts; side variants
+// are normalized to their equivalent family-1 layout. Less common layouts use
+// family 255 so keeping the source channel count still encodes successfully.
+func opusLayoutMapping(channels int, channelLayout string) (layout string, mappingFamily int) {
+	switch channelLayout {
+	case "3.0", "quad", "5.0", "5.1", "6.1", "7.1":
+		return channelLayout, 1
+	case "quad(side)":
+		return "quad", 1
+	case "5.0(side)":
+		return "5.0", 1
+	case "5.1(side)":
+		return "5.1", 1
+	case "":
+		canonical := map[int]string{3: "3.0", 4: "quad", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1"}
+		if layout := canonical[channels]; layout != "" {
+			return layout, 1
+		}
+	}
+	return "", 255
 }
 
 func calculateVideoBitrate(request EncodeRequest, info VideoInfo) (int, error) {
