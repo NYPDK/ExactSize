@@ -328,7 +328,7 @@ func TestUpdateIndicatorIsWiredIntoTheHeader(t *testing.T) {
 		}
 	}
 	combinedUI := string(markup) + string(script)
-	for _, behavior := range []string{"checkForUpdates", "/api/update/check", "/api/update/open-asset", "/api/update/install", "/api/update/status", "updateAvailable", "Open exact AppImage asset"} {
+	for _, behavior := range []string{"checkForUpdates", "/api/update/check", "/api/update/open-asset", "/api/update/install", "/api/update/status", "updateAvailable", "Open exact AppImage asset", "renderInstalledUpdate", `textContent = "Done"`, "closeUpdateDialog();"} {
 		if !strings.Contains(combinedUI, behavior) {
 			t.Fatalf("update UI is missing %q", behavior)
 		}

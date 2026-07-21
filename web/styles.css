@@ -655,6 +655,10 @@ select {
   min-width: 0;
 }
 
+.audio-bitrate-control {
+  grid-template-columns: minmax(76px, 1fr) minmax(64px, auto);
+}
+
 .frame-rate-slider {
   --range-start: 100%;
   --range-end: 100%;

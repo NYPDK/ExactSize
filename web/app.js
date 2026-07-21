@@ -54,6 +54,8 @@ const elements = {
   twoPassRow: $("twoPassRow"),
   audioCodec: $("audioCodec"),
   audioBitrate: $("audioBitrate"),
+  audioBitrateSlider: $("audioBitrateSlider"),
+  audioBitrateValue: $("audioBitrateValue"),
   audioBitrateRow: $("audioBitrateRow"),
   audioChannels: $("audioChannels"),
   audioChannelsRow: $("audioChannelsRow"),
@@ -98,6 +100,7 @@ const state = {
   availableUpdate: null,
   updatePollingTimer: null,
   updateInstalling: false,
+  updateInstalled: false,
   notifiedCorrectionAttempt: 0,
 };
 
@@ -132,11 +135,11 @@ const audioLabels = {
   none: "No audio",
 };
 
-const audioBitrates = {
-  aac: [16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320],
-  opus: [6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 160, 192, 256, 320],
-  vorbis: [48, 64, 96, 128, 160, 192, 256, 320],
-  mp3: [32, 48, 64, 96, 128, 160, 192, 256, 320],
+const audioBitrateRanges = {
+  aac: { min: 16, max: 320, step: 8 },
+  opus: { min: 6, max: 320, step: 2 },
+  vorbis: { min: 48, max: 320, step: 8 },
+  mp3: { min: 32, max: 320, step: 8 },
 };
 
 const extensions = {
@@ -226,15 +229,19 @@ function openUpdateDialog() {
   elements.updateCurrentVersion.textContent = `v${update.currentVersion}`;
   elements.updateLatestVersion.textContent = `v${update.latestVersion}`;
   elements.updateSummary.textContent = `${update.assetName || "The new AppImage"}${update.assetSize ? ` · ${formatBytes(update.assetSize)}` : ""}`;
-  elements.updateDownloadProgress.hidden = true;
-  elements.updateOpenAssetButton.disabled = !update.assetName;
-  elements.updateInstallButton.disabled = !update.canSelfUpdate;
-  elements.updateInstallButton.textContent = "Download & install";
-  elements.updateNote.textContent = update.canSelfUpdate
-    ? "The AppImage is downloaded beside the running copy and replaces it only after its size, SHA-256 digest, and format are verified."
-    : (update.installReason || "Automatic installation is unavailable, but the exact release asset can still be opened.");
+  if (state.updateInstalled) {
+    renderInstalledUpdate();
+  } else {
+    elements.updateDownloadProgress.hidden = true;
+    elements.updateOpenAssetButton.disabled = !update.assetName;
+    elements.updateInstallButton.disabled = !update.canSelfUpdate;
+    elements.updateInstallButton.textContent = "Download & install";
+    elements.updateNote.textContent = update.canSelfUpdate
+      ? "The AppImage is downloaded beside the running copy and replaces it only after its size, SHA-256 digest, and format are verified."
+      : (update.installReason || "Automatic installation is unavailable, but the exact release asset can still be opened.");
+  }
   elements.updateOverlay.hidden = false;
-  (update.canSelfUpdate ? elements.updateInstallButton : elements.updateOpenAssetButton).focus();
+  (state.updateInstalled || update.canSelfUpdate ? elements.updateInstallButton : elements.updateOpenAssetButton).focus();
 }
 
 function closeUpdateDialog() {
@@ -255,6 +262,10 @@ async function openUpdateAsset() {
 }
 
 async function installUpdate() {
+  if (state.updateInstalled) {
+    closeUpdateDialog();
+    return;
+  }
   state.updateInstalling = true;
   elements.updateInstallButton.disabled = true;
   elements.updateOpenAssetButton.disabled = true;
@@ -288,9 +299,7 @@ function pollUpdateStatus() {
         return;
       }
       if (status.state === "installed") {
-        elements.updateInstallButton.textContent = "Installed";
-        elements.updateVersion.textContent = "Restart required";
-        elements.updateNote.textContent = "Close and reopen ExactSize when convenient. The current session can continue running safely.";
+        renderInstalledUpdate();
       } else {
         elements.updateInstallButton.disabled = false;
         elements.updateOpenAssetButton.disabled = false;
@@ -306,6 +315,19 @@ function pollUpdateStatus() {
       elements.updateCloseButton.disabled = false;
     }
   }, 450);
+}
+
+function renderInstalledUpdate() {
+  state.updateInstalled = true;
+  elements.updateDownloadProgress.hidden = false;
+  elements.updateStatusMessage.textContent = "Update installed. Close and reopen ExactSize to use it.";
+  renderUpdateProgress(1, 1);
+  elements.updateInstallButton.textContent = "Done";
+  elements.updateInstallButton.disabled = false;
+  elements.updateOpenAssetButton.disabled = !state.availableUpdate?.assetName;
+  elements.updateCloseButton.disabled = false;
+  elements.updateVersion.textContent = "Restart required";
+  elements.updateNote.textContent = "Close and reopen ExactSize when convenient. The current session can continue running safely.";
 }
 
 function renderUpdateStatus(status) {
@@ -521,7 +543,10 @@ function bindEvents() {
     updateEstimate();
     updateFormState();
   });
-  elements.audioBitrate.addEventListener("change", updateEstimate);
+  elements.audioBitrate.addEventListener("input", () => {
+    updateAudioBitrateLabel();
+    updateEstimate();
+  });
   elements.autoResolution.addEventListener("change", updateFormState);
   elements.frameRateMinimum.addEventListener("input", () => handleFrameRateInput("minimum"));
   elements.frameRateMaximum.addEventListener("input", () => handleFrameRateInput("maximum"));
@@ -668,6 +693,7 @@ async function loadInputPath(path, displayName, isTemp = false) {
     state.inputIsTemp = isTemp;
     renderInput();
     chooseSensibleDefaults(info);
+    refreshAudioBitrates();
     refreshResolutionOptions();
     refreshFrameRateControl(true);
     setSuggestedOutput();
@@ -717,6 +743,7 @@ function resetInputDisplay() {
   elements.emptyInputCopy.hidden = false;
   elements.fileSummary.hidden = true;
   elements.changeFile.hidden = true;
+  refreshAudioBitrates();
   refreshResolutionOptions();
   refreshFrameRateControl(true);
   updateFormState();
@@ -796,13 +823,33 @@ function updateAudioFields() {
 }
 
 function refreshAudioBitrates() {
-  const values = audioBitrates[elements.audioCodec.value] || [];
+  const range = audioBitrateRanges[elements.audioCodec.value];
+  if (!range) return;
+  const sourceBitrate = Number(state.input?.audioBitrateKbps || 0);
+  const maximum = sourceBitrate > 0 ? Math.max(range.min, Math.min(range.max, sourceBitrate)) : range.max;
   const current = Number(elements.audioBitrate.value || 128);
-  const fallback = values.find((value) => value >= current) ?? values.at(-1);
-  replaceOptions(elements.audioBitrate, values.map((value) => ({
-    value: String(value),
-    label: `${value} kbps`,
-  })), String(fallback || 128));
+  const clamped = Math.max(range.min, Math.min(maximum, current));
+  const value = range.min + (Math.round((clamped - range.min) / range.step) * range.step);
+  elements.audioBitrate.min = String(range.min);
+  elements.audioBitrate.max = String(maximum);
+  elements.audioBitrate.step = String(range.step);
+  elements.audioBitrate.value = String(Math.max(range.min, Math.min(maximum, value)));
+  elements.audioBitrate.title = sourceBitrate > 0 && sourceBitrate <= range.max
+    ? `Capped at the source audio bitrate (${sourceBitrate} kbps)`
+    : `Codec range: ${range.min}–${range.max} kbps`;
+  updateAudioBitrateLabel();
+}
+
+function updateAudioBitrateLabel() {
+  const value = Number(elements.audioBitrate.value || 0);
+  const minimum = Number(elements.audioBitrate.min || 0);
+  const maximum = Number(elements.audioBitrate.max || minimum);
+  const progress = maximum > minimum ? ((value - minimum) / (maximum - minimum)) * 100 : 100;
+  elements.audioBitrateSlider.style.setProperty("--range-start", "0%");
+  elements.audioBitrateSlider.style.setProperty("--range-end", `${Math.max(0, Math.min(100, progress))}%`);
+  elements.audioBitrateValue.textContent = `${value} kbps`;
+  elements.audioBitrateValue.title = `${value} kilobits per second for each retained audio track`;
+  elements.audioBitrate.setAttribute("aria-valuetext", `${value} kbps per track`);
 }
 
 function setSuggestedOutput() {

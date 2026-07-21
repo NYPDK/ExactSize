@@ -7,8 +7,8 @@ A local Linux video compressor with one promise: the output is **never larger th
 ## Run it
 
 ```bash
-chmod +x ExactSize-1.9.7-x86_64.AppImage
-./ExactSize-1.9.7-x86_64.AppImage
+chmod +x ExactSize-1.9.8-x86_64.AppImage
+./ExactSize-1.9.8-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
@@ -18,7 +18,7 @@ FFmpeg is bundled. On first run the AppImage adds itself to your app menu with i
 - **Strict size ceiling**: packet-aware container overhead is budgeted up front, then encodes are projected and auto-corrected in strict bitrate cycles at maximum FPS → midpoint FPS → minimum FPS → lower resolution order. Low-bitrate GPU attempts are assessed after at most 30 encoded seconds or about one minute of wall time, with a confidence band that accounts for heavier opening scenes; an attempt is stopped and cleaned up once the evidence shows it cannot fit, and an oversized attempt never replaces your output.
 - **GPU encoding**: NVENC, Quick Sync, VAAPI, and AMF. Every encoder is test-run at launch, so only ones that actually work on your machine are offered, and they're preferred by default.
 - **Modern codecs**: H.264, H.265, H.266/VVC, AV1, VP9. AV2 is wired up and unlocks itself the moment FFmpeg ships an encoder.
-- **Quick presets**: one-click size targets (10–200 MB), speed/quality tiers from Fastest to Higher quality, a dual-handle 5 fps-to-source adaptive frame-rate range that tests at most maximum/midpoint/minimum and restarts bitrate correction at every tier, and an independent Automatic resolution toggle that downscales from the selected starting resolution only after all bitrate and FPS options are exhausted.
+- **Quick presets**: one-click size targets (10–200 MB), speed/quality tiers from Fastest to Higher quality, codec-aware per-track audio bitrate and dual-handle 5 fps-to-source adaptive frame-rate sliders, and an independent Automatic resolution toggle that downscales from the selected starting resolution only after all bitrate and FPS options are exhausted.
 - **Update checks**: once the app is ready, it checks the latest published GitHub Release and shows a compact header action only when a newer version is available.
 - **Single instance**: launching ExactSize while it is already open shows a native warning and exits the new process without spawning another app window or leaving a lock file behind.
 - **Remux / Mux**: switch containers losslessly without re-encoding; if only the audio doesn't fit the new container, Mux copies the video untouched and converts just the audio.

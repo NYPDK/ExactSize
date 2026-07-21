@@ -44,6 +44,40 @@ func TestDisabledFrameRateHandlesStayOpaque(t *testing.T) {
 	}
 }
 
+func TestAudioBitrateUsesCodecAwareSlider(t *testing.T) {
+	html, err := webAssets.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markup := string(html)
+	for _, control := range []string{
+		`id="audioBitrate" type="range" min="16" max="320" step="8" value="128"`,
+		`id="audioBitrateValue" for="audioBitrate">128 kbps</output>`,
+	} {
+		if !strings.Contains(markup, control) {
+			t.Fatalf("audio bitrate slider is missing %q", control)
+		}
+	}
+
+	javascript, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(javascript)
+	for _, behavior := range []string{
+		`aac: { min: 16, max: 320, step: 8 }`,
+		`opus: { min: 6, max: 320, step: 2 }`,
+		`elements.audioBitrate.addEventListener("input"`,
+		"elements.audioBitrateValue.textContent = `${value} kbps`",
+		`state.input?.audioBitrateKbps`,
+		`audioBitrateKbps: Number(elements.audioBitrate.value)`,
+	} {
+		if !strings.Contains(script, behavior) {
+			t.Fatalf("audio bitrate slider is missing %q behavior", behavior)
+		}
+	}
+}
+
 func TestStartingResolutionAndAutomaticFallbackAreSeparateControls(t *testing.T) {
 	html, err := webAssets.ReadFile("web/index.html")
 	if err != nil {

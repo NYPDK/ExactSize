@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ type VideoInfo struct {
 	AudioChannels      int     `json:"audioChannels"`
 	AudioChannelLayout string  `json:"audioChannelLayout,omitempty"`
 	AudioSampleRate    int     `json:"audioSampleRate"`
+	AudioBitrateKbps   int     `json:"audioBitrateKbps,omitempty"`
 	AudioTracks        int     `json:"audioTracks"`
 	SubtitleTracks     int     `json:"subtitleTracks"`
 	Format             string  `json:"format"`
@@ -54,6 +56,7 @@ type ffprobeDocument struct {
 		Channels      int    `json:"channels"`
 		ChannelLayout string `json:"channel_layout"`
 		SampleRate    string `json:"sample_rate"`
+		BitRate       string `json:"bit_rate"`
 	} `json:"streams"`
 	Format struct {
 		Duration   string `json:"duration"`
@@ -79,7 +82,7 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 	defer cancel()
 	command := exec.CommandContext(ctx, ffprobe,
 		"-v", "error",
-		"-show_entries", "format=duration,size,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,channels,channel_layout,sample_rate",
+		"-show_entries", "format=duration,size,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,channels,channel_layout,sample_rate,bit_rate",
 		"-of", "json",
 		path,
 	)
@@ -104,6 +107,7 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 		Duration: duration,
 		Format:   document.Format.FormatName,
 	}
+	reportedAudioBitrates := 0
 	for _, stream := range document.Streams {
 		switch stream.CodecType {
 		case "video":
@@ -127,6 +131,14 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 			if sampleRate > info.AudioSampleRate {
 				info.AudioSampleRate = sampleRate
 			}
+			bitrate, _ := strconv.ParseInt(stream.BitRate, 10, 64)
+			bitrateKbps := int(bitrate / 1000)
+			if bitrateKbps > 0 {
+				reportedAudioBitrates++
+			}
+			if bitrateKbps > info.AudioBitrateKbps {
+				info.AudioBitrateKbps = bitrateKbps
+			}
 			if info.AudioCodec == "" {
 				info.AudioCodec = stream.CodecName
 				info.AudioChannels = stream.Channels
@@ -136,10 +148,73 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 			info.SubtitleTracks++
 		}
 	}
+	if reportedAudioBitrates < info.AudioTracks {
+		// Containers such as Matroska frequently omit stream bit_rate for VBR
+		// audio. Sample up to the first minute of audio packets so the UI can
+		// still avoid offering a re-encode bitrate above the source.
+		if sampled := probeAudioPacketBitrate(ctx, ffprobe, path); sampled > info.AudioBitrateKbps {
+			info.AudioBitrateKbps = sampled
+		}
+	}
 	if info.VideoCodec == "" {
 		return VideoInfo{}, errors.New("the selected file does not contain a video stream")
 	}
 	return info, nil
+}
+
+func probeAudioPacketBitrate(ctx context.Context, ffprobe, path string) int {
+	command := exec.CommandContext(ctx, ffprobe,
+		"-v", "error",
+		"-read_intervals", "0%+60",
+		"-select_streams", "a",
+		"-show_packets",
+		"-show_entries", "packet=stream_index,size,duration_time",
+		"-of", "csv=p=0",
+		path,
+	)
+	output, err := command.Output()
+	if err != nil {
+		return 0
+	}
+
+	type packetTotals struct {
+		bytes   int64
+		seconds float64
+	}
+	totals := make(map[int]packetTotals)
+	reader := csv.NewReader(bytes.NewReader(output))
+	reader.FieldsPerRecord = -1
+	for {
+		fields, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			break
+		}
+		if len(fields) < 3 {
+			continue
+		}
+		streamIndex, indexErr := strconv.Atoi(fields[0])
+		seconds, durationErr := strconv.ParseFloat(fields[1], 64)
+		size, sizeErr := strconv.ParseInt(fields[2], 10, 64)
+		if indexErr != nil || durationErr != nil || sizeErr != nil || seconds <= 0 || size <= 0 {
+			continue
+		}
+		total := totals[streamIndex]
+		total.bytes += size
+		total.seconds += seconds
+		totals[streamIndex] = total
+	}
+
+	maximum := 0
+	for _, total := range totals {
+		bitrateKbps := int((float64(total.bytes) * 8) / total.seconds / 1000)
+		if bitrateKbps > maximum {
+			maximum = bitrateKbps
+		}
+	}
+	return maximum
 }
 
 // OutputBreakdown separates encoded stream payload from the bytes added by

@@ -950,6 +950,29 @@ func TestOpusFivePointOneSideIntegration(t *testing.T) {
 	}
 }
 
+func TestProbeEstimatesAudioBitrateWhenStreamRateIsMissing(t *testing.T) {
+	ffmpeg := testTool(t, "EXACTSIZE_TEST_FFMPEG", "ffmpeg")
+	ffprobe := testTool(t, "EXACTSIZE_TEST_FFPROBE", "ffprobe")
+	directory := t.TempDir()
+	input := filepath.Join(directory, "vbr-audio.mkv")
+	create := exec.Command(ffmpeg,
+		"-hide_banner", "-y", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=64x64:rate=2:duration=2",
+		"-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
+		"-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-b:a", "96k", "-shortest", input,
+	)
+	if output, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("create VBR audio input: %v\n%s", err, output)
+	}
+	info, err := probeVideo(t.Context(), ffprobe, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.AudioBitrateKbps < 80 || info.AudioBitrateKbps > 120 {
+		t.Fatalf("probed audio bitrate = %d kbps, want approximately 96 kbps", info.AudioBitrateKbps)
+	}
+}
+
 func TestValidateRemuxRequest(t *testing.T) {
 	request := EncodeRequest{Input: "/tmp/in.mkv", Output: "/tmp/out.mp4", Container: "mp4", Remux: true}
 	if err := validateEncodeRequest(request); err != nil {

@@ -25,7 +25,7 @@ import (
 	"time"
 )
 
-const version = "1.9.7"
+const version = "1.9.8"
 
 var errAlreadyRunning = errors.New("ExactSize is already running")
 

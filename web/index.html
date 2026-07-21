@@ -205,22 +205,17 @@
                   <option value="none">No audio</option>
                 </select>
               </label>
-              <label class="field-row" id="audioBitrateRow">
+              <div class="field-row" id="audioBitrateRow">
                 <span>Per-track bitrate</span>
-                <select id="audioBitrate">
-                  <option value="16">16 kbps</option>
-                  <option value="24">24 kbps</option>
-                  <option value="32">32 kbps</option>
-                  <option value="48">48 kbps</option>
-                  <option value="64">64 kbps</option>
-                  <option value="96">96 kbps</option>
-                  <option value="128" selected>128 kbps</option>
-                  <option value="160">160 kbps</option>
-                  <option value="192">192 kbps</option>
-                  <option value="256">256 kbps</option>
-                  <option value="320">320 kbps</option>
-                </select>
-              </label>
+                <span class="frame-rate-control audio-bitrate-control">
+                  <span class="frame-rate-slider" id="audioBitrateSlider">
+                    <span class="frame-rate-track" aria-hidden="true"></span>
+                    <span class="frame-rate-selection" aria-hidden="true"></span>
+                    <input class="frame-rate-range" id="audioBitrate" type="range" min="16" max="320" step="8" value="128" aria-label="Per-track audio bitrate" aria-valuetext="128 kbps">
+                  </span>
+                  <output id="audioBitrateValue" for="audioBitrate">128 kbps</output>
+                </span>
+              </div>
               <label class="field-row" id="audioChannelsRow">
                 <span>Channels</span>
                 <select id="audioChannels">
