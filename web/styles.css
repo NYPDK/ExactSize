@@ -1255,14 +1255,112 @@ select {
   }
 }
 
-/* Themed replacement for the browser confirm dialog. */
-.confirm-overlay {
+/* Themed replacement for browser dialogs. */
+.confirm-overlay,
+.update-overlay {
   position: fixed;
   inset: 0;
   z-index: 120;
   display: grid;
   place-items: center;
   background: rgba(10, 10, 8, .62);
+}
+
+.update-dialog {
+  width: min(520px, calc(100vw - 48px));
+  padding: 18px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .5);
+}
+
+.update-dialog-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.update-dialog h2 {
+  margin: 2px 0 0;
+  font-size: 17px;
+  letter-spacing: -.015em;
+}
+
+.update-dialog > p {
+  margin: 12px 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.update-release-card {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.update-release-card > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.update-release-card span {
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+
+.update-release-card strong {
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+
+.update-release-card svg {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.update-download-progress {
+  margin-top: 14px;
+}
+
+.update-progress-copy {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.update-progress-copy strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.update-note {
+  min-height: 36px;
+}
+
+.update-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .confirm-dialog {

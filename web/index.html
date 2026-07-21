@@ -284,6 +284,46 @@
     </main>
   </div>
 
+  <div class="update-overlay" id="updateOverlay" hidden>
+    <section class="update-dialog" role="dialog" aria-modal="true" aria-labelledby="updateTitle" aria-describedby="updateSummary">
+      <div class="update-dialog-head">
+        <div>
+          <span class="eyeline">Verified GitHub release</span>
+          <h2 id="updateTitle">Update ExactSize</h2>
+        </div>
+        <button class="icon-button" id="updateCloseButton" type="button" aria-label="Close update window">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </div>
+      <p id="updateSummary">A newer ExactSize AppImage is available.</p>
+      <div class="update-release-card">
+        <div>
+          <span>Installed</span>
+          <strong id="updateCurrentVersion">—</strong>
+        </div>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-5-5 5 5-5 5"/></svg>
+        <div>
+          <span>Available</span>
+          <strong id="updateLatestVersion">—</strong>
+        </div>
+      </div>
+      <div class="update-download-progress" id="updateDownloadProgress" hidden>
+        <div class="update-progress-copy">
+          <span id="updateStatusMessage">Preparing download…</span>
+          <strong id="updateProgressPercent">0%</strong>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="updateProgressTrack">
+          <div class="progress-fill" id="updateProgressFill"></div>
+        </div>
+      </div>
+      <p class="update-note" id="updateNote">The AppImage is downloaded beside the running copy and replaces it only after its size, SHA-256 digest, and format are verified.</p>
+      <div class="update-actions">
+        <button class="secondary-button" id="updateOpenAssetButton" type="button">Open exact AppImage asset</button>
+        <button class="primary-button" id="updateInstallButton" type="button">Download &amp; install</button>
+      </div>
+    </section>
+  </div>
+
   <div class="confirm-overlay" id="confirmOverlay" hidden>
     <div class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmText">
       <h2 id="confirmTitle">Encode in progress</h2>

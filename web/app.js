@@ -11,6 +11,19 @@ const elements = {
   runtimeLabel: $("runtimeLabel"),
   updateButton: $("updateButton"),
   updateVersion: $("updateVersion"),
+  updateOverlay: $("updateOverlay"),
+  updateCloseButton: $("updateCloseButton"),
+  updateCurrentVersion: $("updateCurrentVersion"),
+  updateLatestVersion: $("updateLatestVersion"),
+  updateSummary: $("updateSummary"),
+  updateNote: $("updateNote"),
+  updateDownloadProgress: $("updateDownloadProgress"),
+  updateStatusMessage: $("updateStatusMessage"),
+  updateProgressTrack: $("updateProgressTrack"),
+  updateProgressFill: $("updateProgressFill"),
+  updateProgressPercent: $("updateProgressPercent"),
+  updateOpenAssetButton: $("updateOpenAssetButton"),
+  updateInstallButton: $("updateInstallButton"),
   themeColor: $("themeColor"),
   themeToggle: $("themeToggle"),
   minimizeButton: $("minimizeButton"),
@@ -82,6 +95,9 @@ const state = {
   encoding: false,
   pollingTimer: null,
   toastTimer: null,
+  availableUpdate: null,
+  updatePollingTimer: null,
+  updateInstalling: false,
   notifiedCorrectionAttempt: 0,
 };
 
@@ -189,30 +205,119 @@ async function checkForUpdates() {
   try {
     const update = await api("/api/update/check");
     if (!update.updateAvailable) return;
-    showUpdateAvailable(update.latestVersion);
+    state.availableUpdate = update;
+    showUpdateAvailable(update);
   } catch {
     // Update checks are opportunistic; offline use must stay fully functional.
   }
 }
 
-function showUpdateAvailable(latestVersion) {
-  const label = `v${latestVersion}`;
+function showUpdateAvailable(update) {
+  const label = `v${update.latestVersion}`;
   elements.updateVersion.textContent = label;
-  elements.updateButton.setAttribute("aria-label", `Update available: ExactSize ${label}. Open the GitHub release page.`);
-  elements.updateButton.title = `Open the ExactSize ${label} release page`;
+  elements.updateButton.setAttribute("aria-label", `Update available: ExactSize ${label}. Review update options.`);
+  elements.updateButton.title = `Review the ExactSize ${label} update`;
   elements.updateButton.hidden = false;
 }
 
-async function openUpdateRelease() {
-  elements.updateButton.disabled = true;
+function openUpdateDialog() {
+  const update = state.availableUpdate;
+  if (!update) return;
+  elements.updateCurrentVersion.textContent = `v${update.currentVersion}`;
+  elements.updateLatestVersion.textContent = `v${update.latestVersion}`;
+  elements.updateSummary.textContent = `${update.assetName || "The new AppImage"}${update.assetSize ? ` · ${formatBytes(update.assetSize)}` : ""}`;
+  elements.updateDownloadProgress.hidden = true;
+  elements.updateOpenAssetButton.disabled = !update.assetName;
+  elements.updateInstallButton.disabled = !update.canSelfUpdate;
+  elements.updateInstallButton.textContent = "Download & install";
+  elements.updateNote.textContent = update.canSelfUpdate
+    ? "The AppImage is downloaded beside the running copy and replaces it only after its size, SHA-256 digest, and format are verified."
+    : (update.installReason || "Automatic installation is unavailable, but the exact release asset can still be opened.");
+  elements.updateOverlay.hidden = false;
+  (update.canSelfUpdate ? elements.updateInstallButton : elements.updateOpenAssetButton).focus();
+}
+
+function closeUpdateDialog() {
+  if (state.updateInstalling) return;
+  elements.updateOverlay.hidden = true;
+}
+
+async function openUpdateAsset() {
+  elements.updateOpenAssetButton.disabled = true;
   try {
-    await api("/api/update/open", { method: "POST" });
-    showToast(`Opened the ${elements.updateVersion.textContent} release page`);
+    await api("/api/update/open-asset", { method: "POST" });
+    showToast(`Opened ${state.availableUpdate?.assetName || "the exact AppImage asset"}`);
   } catch (error) {
     showToast(error.message, true);
   } finally {
-    elements.updateButton.disabled = false;
+    elements.updateOpenAssetButton.disabled = false;
   }
+}
+
+async function installUpdate() {
+  state.updateInstalling = true;
+  elements.updateInstallButton.disabled = true;
+  elements.updateOpenAssetButton.disabled = true;
+  elements.updateCloseButton.disabled = true;
+  elements.updateDownloadProgress.hidden = false;
+  elements.updateStatusMessage.textContent = "Preparing verified download…";
+  renderUpdateProgress(0, 1);
+  try {
+    const status = await api("/api/update/install", { method: "POST" });
+    renderUpdateStatus(status);
+    pollUpdateStatus();
+  } catch (error) {
+    state.updateInstalling = false;
+    elements.updateStatusMessage.textContent = error.message;
+    elements.updateNote.textContent = "Nothing was replaced. You can retry or open the exact AppImage asset instead.";
+    elements.updateInstallButton.disabled = false;
+    elements.updateOpenAssetButton.disabled = false;
+    elements.updateCloseButton.disabled = false;
+  }
+}
+
+function pollUpdateStatus() {
+  window.clearTimeout(state.updatePollingTimer);
+  state.updatePollingTimer = window.setTimeout(async () => {
+    state.updatePollingTimer = null;
+    try {
+      const status = await api("/api/update/status");
+      renderUpdateStatus(status);
+      if (status.state === "downloading") {
+        pollUpdateStatus();
+        return;
+      }
+      if (status.state === "installed") {
+        elements.updateInstallButton.textContent = "Installed";
+        elements.updateVersion.textContent = "Restart required";
+        elements.updateNote.textContent = "Close and reopen ExactSize when convenient. The current session can continue running safely.";
+      } else {
+        elements.updateInstallButton.disabled = false;
+        elements.updateOpenAssetButton.disabled = false;
+        elements.updateNote.textContent = "Nothing was replaced. You can retry or open the exact AppImage asset instead.";
+      }
+      state.updateInstalling = false;
+      elements.updateCloseButton.disabled = false;
+    } catch (error) {
+      state.updateInstalling = false;
+      elements.updateStatusMessage.textContent = error.message;
+      elements.updateInstallButton.disabled = false;
+      elements.updateOpenAssetButton.disabled = false;
+      elements.updateCloseButton.disabled = false;
+    }
+  }, 450);
+}
+
+function renderUpdateStatus(status) {
+  elements.updateStatusMessage.textContent = status.message || "Downloading the verified AppImage…";
+  renderUpdateProgress(status.downloadedBytes || 0, status.totalBytes || 1);
+}
+
+function renderUpdateProgress(downloaded, total) {
+  const percent = Math.max(0, Math.min(100, Math.round((downloaded / total) * 100)));
+  elements.updateProgressFill.style.width = `${percent}%`;
+  elements.updateProgressPercent.textContent = `${percent}%`;
+  elements.updateProgressTrack.setAttribute("aria-valuenow", String(percent));
 }
 
 const resolutionLadder = [2160, 1440, 1080, 720, 540, 480, 360];
@@ -450,7 +555,13 @@ function bindEvents() {
   elements.remuxButton.addEventListener("click", startRemux);
   elements.cancelButton.addEventListener("click", cancelCompression);
   elements.showOutputButton.addEventListener("click", showOutput);
-  elements.updateButton.addEventListener("click", openUpdateRelease);
+  elements.updateButton.addEventListener("click", openUpdateDialog);
+  elements.updateCloseButton.addEventListener("click", closeUpdateDialog);
+  elements.updateOpenAssetButton.addEventListener("click", openUpdateAsset);
+  elements.updateInstallButton.addEventListener("click", installUpdate);
+  elements.updateOverlay.addEventListener("click", (event) => {
+    if (event.target === elements.updateOverlay) closeUpdateDialog();
+  });
   elements.themeToggle.addEventListener("click", toggleTheme);
   elements.quitButton.addEventListener("click", quitApplication);
   elements.errorDismiss.addEventListener("click", clearError);
@@ -479,15 +590,18 @@ async function chooseInput() {
 // server looks for a same-name same-size file in the usual folders. Only when
 // both fail is the content copied to a temporary file.
 async function handleDrop(dataTransfer) {
-  const uri = (dataTransfer.getData("text/uri-list") || "")
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line && !line.startsWith("#"));
-  if (uri && uri.startsWith("file://")) {
-    const path = decodeURIComponent(uri.slice("file://".length));
+  // Drag data is protected after the drop event's synchronous turn. Capture
+  // both the File and every text flavor before the first await so a failed
+  // direct-path probe can still fall back to locating or uploading the file.
+  const [file] = dataTransfer.files;
+  const dragText = [
+    dataTransfer.getData("text/uri-list"),
+    dataTransfer.getData("text/plain"),
+    dataTransfer.getData("x-special/gnome-copied-files"),
+  ];
+  for (const path of droppedFilePaths(dragText)) {
     if (await loadInputPath(path, "", false)) return;
   }
-  const [file] = dataTransfer.files;
   if (!file) return;
   try {
     const located = await api("/api/locate", {
@@ -497,6 +611,29 @@ async function handleDrop(dataTransfer) {
     if (located.path && (await loadInputPath(located.path, "", false))) return;
   } catch {}
   uploadInput(file);
+}
+
+function droppedFilePaths(values) {
+  const paths = [];
+  const seen = new Set();
+  for (const value of values) {
+    for (const rawLine of (value || "").split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#") || line === "copy" || line === "cut") continue;
+      try {
+        const uri = new URL(line);
+        if (uri.protocol !== "file:" || (uri.hostname && uri.hostname !== "localhost")) continue;
+        const path = decodeURIComponent(uri.pathname);
+        if (path && !seen.has(path)) {
+          seen.add(path);
+          paths.push(path);
+        }
+      } catch {
+        // Malformed or non-URL clipboard text is not a local file path.
+      }
+    }
+  }
+  return paths;
 }
 
 async function uploadInput(file) {
@@ -908,6 +1045,10 @@ function confirmQuitDuringEncode() {
 }
 
 async function quitApplication() {
+  if (state.updateInstalling) {
+    showToast("Wait for the AppImage update to finish before closing ExactSize.", true);
+    return;
+  }
   if (state.encoding && !(await confirmQuitDuringEncode())) return;
   try {
     await api("/api/quit", { method: "POST" });

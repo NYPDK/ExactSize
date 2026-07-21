@@ -17,6 +17,7 @@ GO_BIN="${GO_BIN:-go}"
 FFMPEG_BIN="${FFMPEG_BIN:-}"
 FFPROBE_BIN="${FFPROBE_BIN:-}"
 APPIMAGETOOL_BIN="${APPIMAGETOOL_BIN:-}"
+UPDATE_INFORMATION="${UPDATE_INFORMATION:-gh-releases-zsync|NYPDK|ExactSize|latest|ExactSize-*-x86_64.AppImage.zsync}"
 
 FFMPEG_TARBALL_URL="${FFMPEG_TARBALL_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz}"
 FFMPEG_CHECKSUMS_URL="${FFMPEG_CHECKSUMS_URL:-https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/checksums.sha256}"
@@ -100,13 +101,13 @@ done
 
 # --- appimagetool -----------------------------------------------------------
 if [ -z "$APPIMAGETOOL_BIN" ]; then
-  if command -v appimagetool >/dev/null 2>&1; then
-    APPIMAGETOOL_BIN="$(command -v appimagetool)"
-  else
-    APPIMAGETOOL_BIN="$CACHE_DIR/appimagetool-x86_64.AppImage"
-    [ -f "$APPIMAGETOOL_BIN" ] || download "$APPIMAGETOOL_URL" "$APPIMAGETOOL_BIN"
-    chmod +x "$APPIMAGETOOL_BIN"
-  fi
+  # The official AppImage bundles zsyncmake. An arbitrary system
+  # appimagetool may not, in which case it only warns and silently omits the
+  # release metadata file. Use the cached official tool unless explicitly
+  # overridden so both build artifacts are deterministic.
+  APPIMAGETOOL_BIN="$CACHE_DIR/appimagetool-x86_64.AppImage"
+  [ -f "$APPIMAGETOOL_BIN" ] || download "$APPIMAGETOOL_URL" "$APPIMAGETOOL_BIN"
+  chmod +x "$APPIMAGETOOL_BIN"
 else
   APPIMAGETOOL_BIN="$(resolve_tool "$APPIMAGETOOL_BIN")"
 fi
@@ -145,8 +146,25 @@ chmod +x "$APPDIR/AppRun" "$APPDIR/usr/bin/exactsize" "$APPDIR/usr/bin/ffmpeg" "
 
 # APPIMAGE_EXTRACT_AND_RUN lets the appimagetool AppImage run without FUSE;
 # a natively installed appimagetool ignores it.
-ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGETOOL_BIN" "$APPDIR" "$OUTPUT"
-chmod +x "$OUTPUT"
+ZSYNC_OUTPUT="$OUTPUT.zsync"
+GENERATED_ZSYNC="$PROJECT_ROOT/$(basename "$OUTPUT").zsync"
+rm -f "$ZSYNC_OUTPUT"
+if [ "$GENERATED_ZSYNC" != "$ZSYNC_OUTPUT" ]; then
+  rm -f "$GENERATED_ZSYNC"
+fi
+ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 "$APPIMAGETOOL_BIN" \
+  --updateinformation "$UPDATE_INFORMATION" \
+  --file-url "$(basename "$OUTPUT")" \
+  "$APPDIR" "$OUTPUT"
+chmod 0755 "$OUTPUT"
+# appimagetool writes the zsync file to its working directory when DESTINATION
+# is absolute. Normalize it beside OUTPUT so release tooling has one stable
+# artifact location regardless of the caller's current directory.
+if [ "$GENERATED_ZSYNC" != "$ZSYNC_OUTPUT" ] && [ -s "$GENERATED_ZSYNC" ]; then
+  mv "$GENERATED_ZSYNC" "$ZSYNC_OUTPUT"
+fi
+[ -s "$ZSYNC_OUTPUT" ] || die "appimagetool did not generate $ZSYNC_OUTPUT; install zsyncmake or use the downloaded appimagetool"
+chmod 0644 "$ZSYNC_OUTPUT"
 
 # The sealed AppImage keeps the spec-compliant Exec=exactsize. The on-disk
 # AppDir copy points at its own AppRun instead, so double-clicking the desktop
@@ -154,4 +172,4 @@ chmod +x "$OUTPUT"
 # name that is not on PATH.
 sed -i "s|^Exec=.*|Exec=\"$APPDIR/AppRun\"|" "$APPDIR/exactsize.desktop"
 
-printf '%s\n' "$OUTPUT"
+printf '%s\n%s\n' "$OUTPUT" "$ZSYNC_OUTPUT"

@@ -7,8 +7,8 @@ A local Linux video compressor with one promise: the output is **never larger th
 ## Run it
 
 ```bash
-chmod +x ExactSize-1.9.2-x86_64.AppImage
-./ExactSize-1.9.2-x86_64.AppImage
+chmod +x ExactSize-1.9.3-x86_64.AppImage
+./ExactSize-1.9.3-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
@@ -63,7 +63,18 @@ Needs Go 1.24+, `curl`, and `tar` with xz support. Everything else (static FFmpe
 ./scripts/build-appimage.sh
 ```
 
-The result lands in `build/ExactSize-<version>-x86_64.AppImage`. Run the tests with `go test ./...`.
+The build embeds GitHub zsync update metadata and produces both release assets:
+
+- `build/ExactSize-<version>-x86_64.AppImage`
+- `build/ExactSize-<version>-x86_64.AppImage.zsync`
+
+Upload both files to the matching GitHub Release. Run the tests with `go test ./...`.
+
+For a tagged release, the release helper refuses to publish unless both files exist, uploads them together, and verifies both asset names afterward:
+
+```bash
+./scripts/publish-release.sh
+```
 
 ## License
 

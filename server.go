@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"encoding/xml"
@@ -33,14 +34,21 @@ type App struct {
 	statusErr    error
 	vaapiDevices map[string]string
 
-	mu       sync.RWMutex
-	job      *Job
-	shutdown func()
-	uploads  []string
+	mu           sync.RWMutex
+	job          *Job
+	shutdown     func()
+	uploads      []string
+	updating     bool
+	updateCancel context.CancelFunc
+	updateDone   chan struct{}
 
-	updateClient  *http.Client
-	releaseAPIURL string
-	openURL       func(string) error
+	updateClient         *http.Client
+	updateDownloadClient *http.Client
+	releaseAPIURL        string
+	openURL              func(string) error
+	appImagePath         func() (string, error)
+	updateMu             sync.RWMutex
+	updateStatus         UpdateStatus
 }
 
 type AppStatus struct {
@@ -133,10 +141,27 @@ func mountedMediaDirs(base string) []string {
 // directory search would never reach — and only then are the likely
 // directories searched by name and size.
 func locateOriginalFile(name string, size int64) string {
-	if path := locateRecentFile(recentlyUsedPath(), name, size); path != "" {
-		return path
+	return locateOriginalFileIn(name, size, recentlyUsedPath(), dropSearchDirs(), dropLocateRetryDelay)
+}
+
+// locateOriginalFileIn makes two bounded attempts before giving up. On the
+// first drag after launch, mounted-drive directory metadata is often still
+// cold and KDE/GNOME may not have finished adding the dragged file to the
+// recent-documents list. The first pass warms the directory cache; the short
+// pause also gives the desktop time to commit its exact file:// bookmark.
+func locateOriginalFileIn(name string, size int64, recentPath string, dirs []string, retryDelay time.Duration) string {
+	for attempt := 0; attempt < 2; attempt++ {
+		if path := locateRecentFile(recentPath, name, size); path != "" {
+			return path
+		}
+		if path := locateFileIn(dirs, name, size); path != "" {
+			return path
+		}
+		if attempt == 0 && retryDelay > 0 {
+			time.Sleep(retryDelay)
+		}
 	}
-	return locateFileIn(dropSearchDirs(), name, size)
+	return ""
 }
 
 // recentlyUsedPath is the freedesktop shared recent-documents list. GTK
@@ -201,8 +226,9 @@ func locateRecentFile(xbelPath, name string, size int64) string {
 // enormous drives. Past either bound the file is reported as not found,
 // exactly as before the recursive search existed.
 const (
-	dropSearchMaxDepth = 4
-	dropSearchBudget   = time.Second
+	dropSearchMaxDepth   = 4
+	dropSearchBudget     = time.Second
+	dropLocateRetryDelay = 200 * time.Millisecond
 )
 
 // locateFileIn finds a file with the dropped file's base name and exact byte
@@ -333,13 +359,15 @@ type dialogResponse struct {
 
 func newApp(ffmpeg, ffprobe, token string, web fs.FS) *App {
 	return &App{
-		ffmpeg:        ffmpeg,
-		ffprobe:       ffprobe,
-		token:         token,
-		web:           web,
-		updateClient:  defaultUpdateClient(),
-		releaseAPIURL: exactSizeLatestReleaseAPI,
-		openURL:       openExternalURL,
+		ffmpeg:               ffmpeg,
+		ffprobe:              ffprobe,
+		token:                token,
+		web:                  web,
+		updateClient:         defaultUpdateClient(),
+		updateDownloadClient: defaultUpdateDownloadClient(),
+		releaseAPIURL:        exactSizeLatestReleaseAPI,
+		openURL:              openExternalURL,
+		appImagePath:         runningAppImagePath,
 	}
 }
 
@@ -351,7 +379,9 @@ func (a *App) routes() http.Handler {
 	mux.Handle("GET /icon.svg", a.staticHandler())
 	mux.HandleFunc("GET /api/status", a.auth(a.handleStatus))
 	mux.HandleFunc("GET /api/update/check", a.auth(a.handleUpdateCheck))
-	mux.HandleFunc("POST /api/update/open", a.auth(a.handleUpdateOpen))
+	mux.HandleFunc("POST /api/update/open-asset", a.auth(a.handleUpdateOpenAsset))
+	mux.HandleFunc("POST /api/update/install", a.auth(a.handleUpdateInstall))
+	mux.HandleFunc("GET /api/update/status", a.auth(a.handleUpdateStatus))
 	mux.HandleFunc("POST /api/dialog/open", a.auth(a.handleOpenDialog))
 	mux.HandleFunc("POST /api/dialog/save", a.auth(a.handleSaveDialog))
 	mux.HandleFunc("POST /api/upload", a.auth(a.handleUpload))
@@ -549,6 +579,11 @@ func (a *App) handleStartJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	a.mu.Lock()
+	if a.updating {
+		a.mu.Unlock()
+		writeError(w, http.StatusConflict, "wait for the ExactSize update to finish before starting an encode")
+		return
+	}
 	if a.job != nil && !a.job.isTerminal() {
 		a.mu.Unlock()
 		writeError(w, http.StatusConflict, "another encode is already running")
@@ -590,12 +625,23 @@ func (a *App) cancelCurrentJob() {
 	job := a.job
 	uploads := append([]string(nil), a.uploads...)
 	a.uploads = nil
+	updateCancel := a.updateCancel
+	updateDone := a.updateDone
 	a.mu.Unlock()
 	if job != nil && !job.isTerminal() {
 		job.cancel()
 	}
 	for _, path := range uploads {
 		_ = os.Remove(path)
+	}
+	if updateCancel != nil {
+		updateCancel()
+		if updateDone != nil {
+			select {
+			case <-updateDone:
+			case <-time.After(3 * time.Second):
+			}
+		}
 	}
 }
 

@@ -346,3 +346,34 @@ func TestLocateOriginalFileUsesRecentDocuments(t *testing.T) {
 		t.Errorf("locateOriginalFile = %q, want %q", got, clip)
 	}
 }
+
+// Desktop file managers can commit recently-used.xbel just after dispatching
+// the drop event. The locator must reread it once before falling back to a
+// temporary upload, which would lose the source directory for output naming.
+func TestLocateOriginalFileRetriesDelayedRecentDocument(t *testing.T) {
+	sourceDir := filepath.Join(t.TempDir(), "outside-search-roots")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sourceDir, "cold-drop.mp4")
+	if err := os.WriteFile(source, make([]byte, 8192), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	recentDir := t.TempDir()
+	recentPath := filepath.Join(recentDir, "recently-used.xbel")
+	href := (&url.URL{Scheme: "file", Path: source}).String()
+	document := `<xbel version="1.0"><bookmark href="` + href + `"/></xbel>`
+	written := make(chan error, 1)
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		written <- os.WriteFile(recentPath, []byte(document), 0o644)
+	}()
+
+	got := locateOriginalFileIn("cold-drop.mp4", 8192, recentPath, []string{t.TempDir()}, 30*time.Millisecond)
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	if got != source {
+		t.Fatalf("locateOriginalFileIn = %q, want delayed recent path %q", got, source)
+	}
+}
