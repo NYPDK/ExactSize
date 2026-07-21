@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -25,7 +24,7 @@ import (
 	"time"
 )
 
-const version = "1.9.8"
+const version = "1.12.4"
 
 var errAlreadyRunning = errors.New("ExactSize is already running")
 
@@ -47,13 +46,13 @@ var iconPNG []byte
 func main() {
 	if err := run(); err != nil {
 		if errors.Is(err, errAlreadyRunning) {
-			if runtime.GOOS == "linux" && os.Getenv("EXACTSIZE_HEADLESS") != "1" {
+			if os.Getenv("EXACTSIZE_HEADLESS") != "1" {
 				showWarningDialog(alreadyRunningMessage)
 			}
 			return
 		}
 		log.Printf("ExactSize: %v", err)
-		if runtime.GOOS == "linux" {
+		if os.Getenv("EXACTSIZE_HEADLESS") != "1" {
 			showFatalDialog(err.Error())
 		}
 		os.Exit(1)
@@ -140,28 +139,6 @@ func run() error {
 	return nil
 }
 
-// acquireInstanceGuard uses Linux's abstract Unix-socket namespace, so the
-// guard is released by the kernel when ExactSize exits and never leaves a lock
-// file behind. Scoping the name by user allows independent desktop sessions.
-func instanceGuardAddress() string {
-	return "\x00io.exactsize.ExactSize-" + strconv.Itoa(os.Getuid())
-}
-
-func acquireInstanceGuard(name string) (*net.UnixListener, error) {
-	address := &net.UnixAddr{
-		Name: name,
-		Net:  "unix",
-	}
-	listener, err := net.ListenUnix("unix", address)
-	if err != nil {
-		if errors.Is(err, syscall.EADDRINUSE) {
-			return nil, errAlreadyRunning
-		}
-		return nil, fmt.Errorf("create single-instance guard: %w", err)
-	}
-	return listener, nil
-}
-
 func locateTool(envName, name string) (string, error) {
 	if configured := strings.TrimSpace(os.Getenv(envName)); configured != "" {
 		if info, err := os.Stat(configured); err == nil && !info.IsDir() {
@@ -172,13 +149,19 @@ func locateTool(envName, name string) (string, error) {
 
 	if executable, err := os.Executable(); err == nil {
 		dir := filepath.Dir(executable)
-		for _, candidate := range []string{
-			filepath.Join(dir, name),
-			filepath.Join(dir, "..", "lib", "exactsize", name),
-			filepath.Join(dir, "..", "bin", name),
-		} {
-			if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
-				return filepath.Clean(candidate), nil
+		names := []string{name}
+		if runtime.GOOS == "windows" {
+			names = append(names, name+".exe")
+		}
+		for _, toolName := range names {
+			for _, candidate := range []string{
+				filepath.Join(dir, toolName),
+				filepath.Join(dir, "..", "lib", "exactsize", toolName),
+				filepath.Join(dir, "..", "bin", toolName),
+			} {
+				if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+					return filepath.Clean(candidate), nil
+				}
 			}
 		}
 	}
@@ -197,18 +180,6 @@ func randomToken() string {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(data)
-}
-
-func processIsRunning(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	err = process.Signal(syscall.Signal(0))
-	return err == nil || errors.Is(err, os.ErrPermission)
 }
 
 func cleanupStaleBrowserProfiles() {
@@ -253,89 +224,6 @@ func createBrowserProfile() (string, func(), error) {
 		once.Do(func() { _ = os.RemoveAll(profileDir) })
 	}
 	return profileDir, cleanup, nil
-}
-
-func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
-	type candidate struct {
-		command string
-		args    []string
-		wait    bool
-		profile bool
-	}
-
-	profileDir, cleanupProfile, err := createBrowserProfile()
-	if err != nil {
-		return nil, false, func() {}, fmt.Errorf("create temporary browser profile: %w", err)
-	}
-	// Pre-acknowledge Brave's analytics notice and disable its reporting; a
-	// fresh profile would otherwise show the banner on every launch. Chrome
-	// and Chromium ignore these keys.
-	seed := []byte(`{"brave":{"p3a":{"enabled":false,"notice_acknowledged":true},"stats_reporting":{"enabled":false}}}`)
-	_ = os.WriteFile(filepath.Join(profileDir, "Local State"), seed, 0o600)
-	chromeArgs := []string{
-		"--app=" + url,
-		"--new-window",
-		"--no-first-run",
-		"--disable-session-crashed-bubble",
-		"--class=ExactSize",
-		fmt.Sprintf("--window-size=%d,%d", minimumWindowWidth, minimumWindowHeight),
-		// XWayland instead of native Wayland: X11 windows can start a real
-		// compositor move/resize (_NET_WM_MOVERESIZE), which native Wayland
-		// offers no external API for, and --class works as the window class.
-		"--ozone-platform=x11",
-		"--disable-background-networking",
-		"--disable-component-update",
-		"--disable-default-apps",
-		"--disable-sync",
-		"--disk-cache-size=1048576",
-		"--media-cache-size=1048576",
-		"--user-data-dir=" + profileDir,
-	}
-
-	var candidates []candidate
-	if preferred := strings.TrimSpace(os.Getenv("EXACTSIZE_BROWSER")); preferred != "" {
-		candidates = append(candidates, candidate{preferred, chromeArgs, true, true})
-	}
-	for _, browser := range []string{
-		"brave-browser", "brave", "google-chrome-stable", "google-chrome",
-		"chromium", "chromium-browser", "microsoft-edge-stable", "microsoft-edge",
-	} {
-		candidates = append(candidates, candidate{browser, chromeArgs, true, true})
-	}
-	if _, err := exec.LookPath("flatpak"); err == nil {
-		for _, appID := range []string{
-			"com.brave.Browser", "org.chromium.Chromium", "com.google.Chrome",
-		} {
-			if exec.Command("flatpak", "info", appID).Run() != nil {
-				continue
-			}
-			args := append([]string{"run", appID}, chromeArgs...)
-			candidates = append(candidates, candidate{"flatpak", args, true, true})
-		}
-	}
-	candidates = append(candidates,
-		candidate{"firefox", []string{"--new-window", url}, false, false},
-		candidate{"xdg-open", []string{url}, false, false},
-	)
-
-	for _, item := range candidates {
-		path, err := exec.LookPath(item.command)
-		if err != nil {
-			continue
-		}
-		cmd := exec.Command(path, item.args...)
-		cmd.Stdout = io.Discard
-		cmd.Stderr = io.Discard
-		if err := cmd.Start(); err == nil {
-			if !item.profile {
-				cleanupProfile()
-			}
-			return cmd, item.wait, cleanupProfile, nil
-		}
-	}
-
-	cleanupProfile()
-	return nil, false, func() {}, errors.New("no supported browser was found (Brave, Chrome, Chromium, Firefox, or xdg-open)")
 }
 
 // integrateAppImage installs a launcher entry and icons under ~/.local/share
@@ -602,6 +490,10 @@ func hideTitleBarOnKDE() {
 }
 
 func showFatalDialog(message string) {
+	if runtime.GOOS == "windows" {
+		showWindowsMessageBox(message, true)
+		return
+	}
 	if path, err := exec.LookPath("kdialog"); err == nil {
 		_ = exec.Command(path, "--error", message, "--title", "ExactSize").Run()
 		return
@@ -612,6 +504,10 @@ func showFatalDialog(message string) {
 }
 
 func showWarningDialog(message string) {
+	if runtime.GOOS == "windows" {
+		showWindowsMessageBox(message, false)
+		return
+	}
 	if path, err := exec.LookPath("kdialog"); err == nil {
 		_ = exec.Command(path, "--sorry", message, "--title", "ExactSize").Run()
 		return

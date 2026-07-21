@@ -1,17 +1,27 @@
 # ExactSize
 
-A local Linux video compressor with one promise: the output is **never larger than the size you set**. Pick a video, a maximum size, and a codec. ExactSize works out the bitrate, encodes, measures the real file, and only saves it once it fits.
+A local Linux, Windows, and Android video compressor with one promise: the output is **never larger than the size you set**. Pick a video, a maximum size, and a codec. ExactSize works out the bitrate, encodes, measures the real file, and only saves it once it fits.
 
 ![ExactSize showing a completed AV1 compression](docs/images/exactsize-preview.png)
 
 ## Run it
 
+### Linux
+
 ```bash
-chmod +x ExactSize-1.9.8-x86_64.AppImage
-./ExactSize-1.9.8-x86_64.AppImage
+chmod +x ExactSize-1.12.4-x86_64.AppImage
+./ExactSize-1.12.4-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
+
+### Windows
+
+Extract `ExactSize-1.12.4-windows-x86_64.zip` and run `ExactSize.exe`. Keep `ffmpeg.exe` and `ffprobe.exe` beside it; the folder is portable and needs no installer. ExactSize uses Edge, Chrome, Brave, or the registered browser for its local interface.
+
+### Android
+
+Install `ExactSize-1.12.4-android-arm64.apk` on a 64-bit Android 9 or newer device. The APK uses the Android document picker for input and output, bundles software x264/AAC plus dav1d for reliable AV1 input decoding, and runtime-probes FFmpeg's native Android MediaCodec encoders. H.264, H.265/HEVC, VP9, and AV1 are exposed when the device can encode them; AV1's usable frame-size limit is also probed so oversized phone videos are fitted to the encoder instead of failing. Scaling follows the input's display rotation and pixel aspect ratio, so portrait, square, 4:3, ultrawide, and anamorphic sources retain their original shape. Compression continues through an Android foreground media-processing service when the app is sent Home or dismissed from Recents; its notification shows the real phase, percentage, time remaining, and encoded size, provides a Cancel action, and alerts separately on completion or failure. H.264/HEVC/VP9 are commonly hardware-backed, while AV1 may be a software device fallback (the Pixel 7 Pro test device reports that behavior). Desktop-only encoding libraries such as x265, libaom, libvpx, and vvenc are not bundled in the APK yet because they substantially increase size and CPU/battery cost. The first local build creates a development signing key under `build/android/keys`; set the documented signing environment variables in `scripts/build-android.sh` when using your own release key.
 
 ## Features
 
@@ -57,20 +67,44 @@ Hardware limits no driver fixes: AV1 encoding needs RX 7000+ / RTX 40+ / Intel A
 
 ## Build from source
 
-Needs Go 1.24+, `curl`, and `tar` with xz support. Everything else (static FFmpeg, appimagetool) is downloaded and checksum-verified automatically:
+All targets need Go 1.24+ and `curl`. Platform toolchains and media payloads are downloaded into `build/` and verified by their build scripts.
+
+Linux AppImage (`tar` with xz support is also required):
 
 ```bash
 ./scripts/build-appimage.sh
 ```
 
-The build embeds GitHub zsync update metadata and produces both release assets:
+The Linux build embeds GitHub zsync update metadata and produces:
 
 - `build/ExactSize-<version>-x86_64.AppImage`
 - `build/ExactSize-<version>-x86_64.AppImage.zsync`
 
-Upload both files to the matching GitHub Release. Run the tests with `go test ./...`.
+Windows portable ZIP (`unzip` and `zip` are also required):
 
-For a tagged release, the release helper refuses to publish unless both files exist, uploads them together, and verifies both asset names afterward:
+```bash
+./scripts/build-windows.sh
+```
+
+This produces `build/ExactSize-<version>-windows-x86_64.zip` with `ExactSize.exe`, `ffmpeg.exe`, `ffprobe.exe`, licenses, and notices.
+
+Android arm64 APK (`make`, `tar`, `unzip`, and `zip` are also required):
+
+```bash
+./scripts/build-android.sh
+```
+
+The Android script downloads a pinned JDK, Android SDK/NDK, FFmpeg, x264, dav1d, Meson, and Ninja, builds the native payloads from source, and produces `build/ExactSize-<version>-android-arm64.apk`.
+
+Run the Go tests for the shared application code with:
+
+```bash
+go test ./...
+```
+
+Upload the platform artifacts to the matching GitHub Release.
+
+For a tagged Linux release, the release helper refuses to publish unless both AppImage files exist, uploads them together, and verifies both asset names afterward:
 
 ```bash
 ./scripts/publish-release.sh

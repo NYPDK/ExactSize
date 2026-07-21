@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -155,6 +156,10 @@ func TestVideoEncoderArgsPerFamily(t *testing.T) {
 			t.Fatal("software encoders should not receive the hardware VBR cap")
 		}
 	}
+
+	mediacodec := videoEncoderArgs(EncodeRequest{Encoder: "h264_mediacodec", VideoCodec: "h264", Preset: "fast"}, info, 3000)
+	assertArgs(t, mediacodec, "-ndk_async", "1")
+	assertArgs(t, mediacodec, "-g", "250")
 }
 
 func assertArgs(t *testing.T, args []string, flag, want string) {
@@ -298,6 +303,7 @@ func TestScaleDimensions(t *testing.T) {
 		{1920, 1080, 2160, 0, 0}, // never upscale
 		{1920, 1080, 0, 0, 0},    // auto
 		{1080, 1920, 720, 404, 720},
+		{1024, 768, 360, 480, 360},
 		{0, 0, 720, 0, 0},
 	}
 	for _, test := range tests {
@@ -306,6 +312,30 @@ func TestScaleDimensions(t *testing.T) {
 			t.Errorf("scaleDimensions(%d, %d, %d) = %d, %d; want %d, %d",
 				test.sourceW, test.sourceH, test.target, w, h, test.wantW, test.wantH)
 		}
+	}
+}
+
+func TestDisplayGeometryAccountsForRotationAndPixelAspect(t *testing.T) {
+	rotated := ffprobeStream{Width: 3840, Height: 2160, SampleAspect: "1:1"}
+	rotated.SideDataList = append(rotated.SideDataList, struct {
+		Rotation float64 `json:"rotation"`
+	}{Rotation: 90})
+	if width, height, normalize := displayGeometry(rotated); width != 2160 || height != 3840 || normalize {
+		t.Fatalf("rotated display geometry = %d×%d normalize=%v; want 2160×3840 false", width, height, normalize)
+	}
+
+	anamorphic := ffprobeStream{Width: 720, Height: 480, SampleAspect: "8:9"}
+	if width, height, normalize := displayGeometry(anamorphic); width != 640 || height != 480 || !normalize {
+		t.Fatalf("anamorphic display geometry = %d×%d normalize=%v; want 640×480 true", width, height, normalize)
+	}
+	args := videoEncoderArgs(EncodeRequest{Encoder: "libx264", VideoCodec: "h264"}, VideoInfo{
+		Width: 640, Height: 480, PixelFormat: "yuv420p", normalizeAspect: true,
+	}, 800)
+	assertArgs(t, args, "-vf", "scale=640:480:flags=lanczos")
+
+	tagged := ffprobeStream{Width: 1280, Height: 720, SampleAspect: "1/1", Tags: map[string]string{"rotate": "-90"}}
+	if width, height, _ := displayGeometry(tagged); width != 720 || height != 1280 {
+		t.Fatalf("tag-rotated display geometry = %d×%d; want 720×1280", width, height)
 	}
 }
 
@@ -324,9 +354,37 @@ func TestStartingResolutionIsIndependentFromAutomaticFallback(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			width, height, automaticFallback := startingResolution(test.request, info)
-			if width != test.wantW || height != test.wantH || automaticFallback != test.wantAutomaticFallback {
-				t.Fatalf("startingResolution = %d×%d, %v; want %d×%d, %v", width, height, automaticFallback, test.wantW, test.wantH, test.wantAutomaticFallback)
+			width, height, automaticFallback, encoderLimited := startingResolution(test.request, info)
+			if width != test.wantW || height != test.wantH || automaticFallback != test.wantAutomaticFallback || encoderLimited {
+				t.Fatalf("startingResolution = %d×%d, fallback=%v, limited=%v; want %d×%d, fallback=%v, limited=false", width, height, automaticFallback, encoderLimited, test.wantW, test.wantH, test.wantAutomaticFallback)
+			}
+		})
+	}
+}
+
+func TestStartingResolutionFitsMediaCodecFrameLimit(t *testing.T) {
+	limits := EncodeRequest{EncoderMaxLong: 1920, EncoderMaxShort: 1080}
+	tests := []struct {
+		name         string
+		info         VideoInfo
+		resolution   int
+		wantW, wantH int
+		wantLimited  bool
+	}{
+		{"portrait 4K", VideoInfo{Width: 2160, Height: 3840}, 0, 1080, 1920, true},
+		{"tall phone", VideoInfo{Width: 1080, Height: 2340}, 0, 886, 1920, true},
+		{"landscape 4K", VideoInfo{Width: 3840, Height: 2160}, 0, 1920, 1080, true},
+		{"square", VideoInfo{Width: 1440, Height: 1440}, 0, 1080, 1080, true},
+		{"already supported", VideoInfo{Width: 1920, Height: 1080}, 0, 0, 0, false},
+		{"user selected smaller", VideoInfo{Width: 3840, Height: 2160}, 720, 1280, 720, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := limits
+			request.ResolutionHeight = test.resolution
+			width, height, _, limited := startingResolution(request, test.info)
+			if width != test.wantW || height != test.wantH || limited != test.wantLimited {
+				t.Fatalf("startingResolution = %d×%d, limited=%v; want %d×%d, limited=%v", width, height, limited, test.wantW, test.wantH, test.wantLimited)
 			}
 		})
 	}
@@ -543,6 +601,19 @@ func TestOutputSizeMonitorProjectsTrajectoryAtTwentyFivePercent(t *testing.T) {
 	}
 }
 
+func TestOutputSizeMonitorCanDisableSoftwareTrajectoryProjection(t *testing.T) {
+	monitor := newOutputSizeMonitor(100, 100_000_000, false)
+	monitor.trajectoryProjection = false
+	for _, seconds := range []float64{10, 15, 20, 25, 50} {
+		if decision := monitor.observe(seconds, int64(seconds*1_500_000), seconds); decision != nil {
+			t.Fatalf("software trajectory should be allowed to finish for exact measurement, got %+v", decision)
+		}
+	}
+	if decision := monitor.observe(75, 100_000_001, 75); decision == nil || !decision.ExceededTarget {
+		t.Fatalf("a partial file already above target must still stop immediately, got %+v", decision)
+	}
+}
+
 func TestHardwareOutputSizeMonitorUsesTimeBoundedCheckpoint(t *testing.T) {
 	monitor := newOutputSizeMonitor(90*60, 100_000_000, true)
 	for _, seconds := range []float64{10, 15, 20, 25, 30} {
@@ -733,7 +804,7 @@ func TestRunFFmpegPreservesUsefulCorrectionMessage(t *testing.T) {
 	}
 	job := newJob(validTestRequest())
 	job.status.Message = bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 30)
-	if err := job.runFFmpeg(ffmpeg, nil, 1, 30, 1, 1, 2, filepath.Join(tempDir, "output.webm"), 0, false); err != nil {
+	if err := job.runFFmpeg(ffmpeg, nil, 1, 30, 1, 1, 2, filepath.Join(tempDir, "output.webm"), 0, false, false); err != nil {
 		t.Fatal(err)
 	}
 	if got := job.snapshot().Message; got != bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 30) {
@@ -970,6 +1041,61 @@ func TestProbeEstimatesAudioBitrateWhenStreamRateIsMissing(t *testing.T) {
 	}
 	if info.AudioBitrateKbps < 80 || info.AudioBitrateKbps > 120 {
 		t.Fatalf("probed audio bitrate = %d kbps, want approximately 96 kbps", info.AudioBitrateKbps)
+	}
+}
+
+func TestRotatedAspectRatioIntegration(t *testing.T) {
+	ffmpeg := testTool(t, "EXACTSIZE_TEST_FFMPEG", "ffmpeg")
+	ffprobe := testTool(t, "EXACTSIZE_TEST_FFPROBE", "ffprobe")
+	directory := t.TempDir()
+	base := filepath.Join(directory, "coded-landscape.mp4")
+	input := filepath.Join(directory, "display-portrait.mp4")
+	create := exec.Command(ffmpeg,
+		"-hide_banner", "-y", "-loglevel", "error",
+		"-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=24:duration=1",
+		"-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", base,
+	)
+	if output, err := create.CombinedOutput(); err != nil {
+		t.Fatalf("create rotated-aspect base: %v\n%s", err, output)
+	}
+	rotate := exec.Command(ffmpeg,
+		"-hide_banner", "-y", "-loglevel", "error",
+		"-display_rotation", "90", "-i", base, "-c", "copy", input,
+	)
+	if output, err := rotate.CombinedOutput(); err != nil {
+		t.Fatalf("add display rotation: %v\n%s", err, output)
+	}
+
+	inputInfo, err := probeVideo(t.Context(), ffprobe, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inputInfo.Width != 720 || inputInfo.Height != 1280 {
+		t.Fatalf("display-oriented input = %d×%d; want 720×1280", inputInfo.Width, inputInfo.Height)
+	}
+
+	output := filepath.Join(directory, "output.mp4")
+	request := EncodeRequest{
+		Input: input, Output: output, TargetBytes: 300_000,
+		Container: "mp4", VideoCodec: "h264", Encoder: "libx264", Preset: "fastest",
+		AudioCodec: "none", ResolutionHeight: 360,
+	}
+	job := newJob(request)
+	job.run(ffmpeg, ffprobe)
+	if result := job.snapshot(); result.State != "completed" {
+		t.Fatalf("rotated-aspect encode ended in %s: %s", result.State, result.Error)
+	}
+	outputInfo, err := probeVideo(t.Context(), ffprobe, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputAspect := float64(inputInfo.Width) / float64(inputInfo.Height)
+	outputAspect := float64(outputInfo.Width) / float64(outputInfo.Height)
+	if math.Abs(inputAspect-outputAspect) > 0.01 {
+		t.Fatalf("display aspect changed from %.5f (%d×%d) to %.5f (%d×%d)",
+			inputAspect, inputInfo.Width, inputInfo.Height,
+			outputAspect, outputInfo.Width, outputInfo.Height,
+		)
 	}
 }
 

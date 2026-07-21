@@ -34,11 +34,13 @@ var minimumAudioBitrateKbps = map[string]int{
 var downscaleLadder = []int{720, 540, 360}
 
 type EncoderInfo struct {
-	ID       string `json:"id"`
-	Codec    string `json:"codec"`
-	Name     string `json:"name"`
-	TwoPass  bool   `json:"twoPass"`
-	Hardware bool   `json:"hardware"`
+	ID           string `json:"id"`
+	Codec        string `json:"codec"`
+	Name         string `json:"name"`
+	TwoPass      bool   `json:"twoPass"`
+	Hardware     bool   `json:"hardware"`
+	MaxLongSide  int    `json:"maxLongSide,omitempty"`
+	MaxShortSide int    `json:"maxShortSide,omitempty"`
 }
 
 type EncodeRequest struct {
@@ -62,6 +64,8 @@ type EncodeRequest struct {
 	VAAPIDevice      string  `json:"-"`
 	ScaleWidth       int     `json:"-"`
 	ScaleHeight      int     `json:"-"`
+	EncoderMaxLong   int     `json:"-"`
+	EncoderMaxShort  int     `json:"-"`
 }
 
 // mapProbeCodec normalizes an ffprobe codec name onto the app's codec keys;
@@ -141,15 +145,16 @@ func (err *earlySizeCorrectionError) Error() string {
 }
 
 type outputSizeMonitor struct {
-	duration            float64
-	targetBytes         int64
-	sampleStartSeconds  float64
-	decisionSeconds     float64
-	minimumSampleSpan   float64
-	maximumDecisionWall float64
-	minimumMarginRatio  float64
-	earlyMarginRatio    float64
-	samples             []outputSizeSample
+	duration             float64
+	targetBytes          int64
+	sampleStartSeconds   float64
+	decisionSeconds      float64
+	minimumSampleSpan    float64
+	maximumDecisionWall  float64
+	minimumMarginRatio   float64
+	earlyMarginRatio     float64
+	trajectoryProjection bool
+	samples              []outputSizeSample
 }
 
 func newOutputSizeMonitor(duration float64, targetBytes int64, timeBounded bool) *outputSizeMonitor {
@@ -157,12 +162,13 @@ func newOutputSizeMonitor(duration float64, targetBytes int64, timeBounded bool)
 		return nil
 	}
 	monitor := &outputSizeMonitor{
-		duration:           duration,
-		targetBytes:        targetBytes,
-		sampleStartSeconds: duration * 0.10,
-		decisionSeconds:    duration * 0.25,
-		minimumSampleSpan:  duration * 0.05,
-		minimumMarginRatio: 0.02,
+		duration:             duration,
+		targetBytes:          targetBytes,
+		sampleStartSeconds:   duration * 0.10,
+		decisionSeconds:      duration * 0.25,
+		minimumSampleSpan:    duration * 0.05,
+		minimumMarginRatio:   0.02,
+		trajectoryProjection: true,
 	}
 	if timeBounded {
 		// Hardware rate control and its minimum-bitrate floors become clear
@@ -199,6 +205,9 @@ func (monitor *outputSizeMonitor) observe(encodedSeconds float64, encodedBytes i
 		}
 	}
 	if fraction >= 1 {
+		return nil
+	}
+	if !monitor.trajectoryProjection {
 		return nil
 	}
 	if encodedSeconds < monitor.sampleStartSeconds {
@@ -408,7 +417,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	// ResolutionHeight selects the starting size (zero means source). The
 	// independent AutoResolution toggle controls whether correction may step
 	// down from that starting point after bitrate and FPS are exhausted.
-	startWidth, startHeight, autoResolution := startingResolution(j.request, info)
+	startWidth, startHeight, autoResolution, encoderLimited := startingResolution(j.request, info)
 	j.request.ScaleWidth, j.request.ScaleHeight = startWidth, startHeight
 	initialScaleWidth, initialScaleHeight := j.request.ScaleWidth, j.request.ScaleHeight
 	useTwoPass := j.request.TwoPass && encoder.TwoPass
@@ -455,6 +464,12 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	previousOutputFPS := -1.0
 	adaptiveFPSStage := 0
 	maximumAttempts := correctionAttemptLimit(j.request, info, autoResolution)
+	if !encoder.Hardware {
+		// Software rate control is deterministic enough that a completed output
+		// normally converges in one measured correction. Keep retries tightly
+		// bounded; adaptive FPS/resolution fallback is hardware-only.
+		maximumAttempts = min(maximumAttempts, 3)
+	}
 	attemptMessage := ""
 
 	for attempt := 1; attempt <= maximumAttempts; attempt++ {
@@ -484,18 +499,18 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		var earlyCorrection *earlySizeCorrectionError
 		if useTwoPass {
 			firstPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, true)
-			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, progressFPS, 1, 2, attempt, tempOutput, 0, false); err != nil {
+			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, progressFPS, 1, 2, attempt, tempOutput, 0, false, false); err != nil {
 				return err
 			}
 			secondPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 2, true)
-			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection); err != nil {
+			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
 				if !errors.As(err, &earlyCorrection) {
 					return err
 				}
 			}
 		} else {
 			args := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, false)
-			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection); err != nil {
+			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
 				if !errors.As(err, &earlyCorrection) {
 					return err
 				}
@@ -535,7 +550,8 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			}
 			finalOutputFPS := effectiveOutputFPS(j.request, info)
 			adaptedFPS := finalOutputFPS < initialOutputFPS-0.001
-			adaptedResolution := j.request.ScaleWidth != initialScaleWidth || j.request.ScaleHeight != initialScaleHeight
+			targetAdaptedResolution := j.request.ScaleWidth != initialScaleWidth || j.request.ScaleHeight != initialScaleHeight
+			adaptedResolution := encoderLimited || targetAdaptedResolution
 			details := make([]string, 0, 2)
 			if j.request.ScaleHeight > 0 {
 				details = append(details, fmt.Sprintf("%d×%d", j.request.ScaleWidth, j.request.ScaleHeight))
@@ -547,7 +563,12 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			if len(details) > 0 {
 				message += " at " + strings.Join(details, " and ")
 			}
-			if adaptedFPS || adaptedResolution {
+			switch {
+			case encoderLimited && (adaptedFPS || targetAdaptedResolution):
+				message += " (adapted for encoder compatibility and target)"
+			case encoderLimited:
+				message += " (adapted for encoder compatibility)"
+			case adaptedFPS || adaptedResolution:
 				message += " (adapted to fit the target)"
 			}
 			j.set(func(status *JobSnapshot) {
@@ -823,7 +844,7 @@ func (j *Job) runRemux(ffmpeg string, info VideoInfo) error {
 	}
 	args = append(args, "-progress", "pipe:1", "-nostats", "-f", muxerName(container), tempOutput)
 
-	if err := j.runFFmpeg(ffmpeg, args, info.Duration, info.FPS, 1, 1, 1, tempOutput, 0, false); err != nil {
+	if err := j.runFFmpeg(ffmpeg, args, info.Duration, info.FPS, 1, 1, 1, tempOutput, 0, false, false); err != nil {
 		return err
 	}
 	stat, err := os.Stat(tempOutput)
@@ -848,7 +869,7 @@ func (j *Job) runRemux(ffmpeg string, info VideoInfo) error {
 	return nil
 }
 
-func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pass, passes, attempt int, output string, targetBytes int64, timeBoundedProjection bool) error {
+func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pass, passes, attempt int, output string, targetBytes int64, timeBoundedProjection, allowTrajectoryProjection bool) error {
 	phase := "Encoding"
 	if passes == 2 {
 		phase = fmt.Sprintf("Encoding pass %d of 2", pass)
@@ -861,6 +882,7 @@ func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pas
 	})
 
 	command := exec.CommandContext(j.ctx, ffmpeg, args...)
+	configureBackgroundCommand(command)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return err
@@ -872,6 +894,12 @@ func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pas
 	}
 
 	monitor := newOutputSizeMonitor(duration, targetBytes, timeBoundedProjection)
+	if monitor != nil {
+		// Completed software outputs can be probed for exact stream and mux
+		// overhead. Their early two-pass byte trajectory is not representative
+		// enough to justify throwing away a full first pass.
+		monitor.trajectoryProjection = allowTrajectoryProjection
+	}
 	monitorStarted := time.Now()
 	var earlyCorrection *earlySizeCorrectionError
 	scanner := bufio.NewScanner(stdout)
@@ -988,7 +1016,7 @@ func buildFFmpegArgs(request EncodeRequest, info VideoInfo, videoKbps int, outpu
 			"-an", "-sn", "-dn",
 			"-fps_mode", "passthrough",
 			"-progress", "pipe:1", "-nostats",
-			"-f", "null", "/dev/null",
+			"-f", "null", os.DevNull,
 		)
 		return args
 	}
@@ -1051,6 +1079,11 @@ func videoEncoderArgs(request EncodeRequest, info VideoInfo, bitrateKbps int) []
 			tileColumns = "3"
 		}
 		args = append(args, "-deadline", "good", "-cpu-used", pick("5", "4", "2", "1"), "-row-mt", "1", "-tile-columns", tileColumns, "-frame-parallel", "1", "-threads", threads)
+	case isMediaCodecEncoder(request.Encoder):
+		// MediaCodec uses an interval in seconds internally; a 250-frame GOP
+		// keeps keyframe overhead comparable to the software encoders while
+		// remaining within Android codec service limits.
+		args = append(args, "-ndk_async", "1", "-g", "250")
 	case strings.HasSuffix(request.Encoder, "_nvenc"):
 		args = append(args, "-preset", pick("p1", "p3", "p5", "p7"))
 	case strings.HasSuffix(request.Encoder, "_qsv"):
@@ -1089,8 +1122,9 @@ func videoEncoderArgs(request EncodeRequest, info VideoInfo, bitrateKbps int) []
 			filters = append(filters, filter)
 		}
 		filters = append(filters, "format="+surface, "hwupload")
-		if request.ScaleHeight > 0 {
-			filters = append(filters, fmt.Sprintf("scale_vaapi=%d:%d", request.ScaleWidth, request.ScaleHeight))
+		scaleWidth, scaleHeight := aspectAwareScale(request, info)
+		if scaleHeight > 0 {
+			filters = append(filters, fmt.Sprintf("scale_vaapi=%d:%d", scaleWidth, scaleHeight))
 		}
 		args = append(args, "-vf", strings.Join(filters, ","))
 	case request.Encoder == "libvvenc":
@@ -1118,17 +1152,31 @@ func videoEncoderArgs(request EncodeRequest, info VideoInfo, bitrateKbps int) []
 }
 
 func appendVideoFilters(args []string, request EncodeRequest, info VideoInfo) []string {
-	filters := make([]string, 0, 2)
+	filters := make([]string, 0, 3)
 	if filter := frameRateFilter(request, info); filter != "" {
 		filters = append(filters, filter)
 	}
-	if request.ScaleHeight > 0 {
-		filters = append(filters, fmt.Sprintf("scale=%d:%d:flags=lanczos", request.ScaleWidth, request.ScaleHeight))
+	if width, height := aspectAwareScale(request, info); height > 0 {
+		filters = append(filters, fmt.Sprintf("scale=%d:%d:flags=lanczos", width, height))
 	}
 	if len(filters) == 0 {
 		return args
 	}
 	return append(args, "-vf", strings.Join(filters, ","))
+}
+
+// aspectAwareScale returns an explicit user/automatic scale when present. A
+// non-square-pixel input also needs one normalization scale at source size.
+// FFmpeg then derives the exact residual sample aspect ratio itself, which is
+// important when an even coded width cannot represent the display ratio alone.
+func aspectAwareScale(request EncodeRequest, info VideoInfo) (width, height int) {
+	if request.ScaleWidth > 0 && request.ScaleHeight > 0 {
+		return request.ScaleWidth, request.ScaleHeight
+	}
+	if info.normalizeAspect {
+		return info.Width, info.Height
+	}
+	return 0, 0
 }
 
 // effectiveOutputFPS returns the frame rate used for encoding and progress.
@@ -1232,13 +1280,45 @@ func scaleDimensions(sourceWidth, sourceHeight, targetHeight int) (int, int) {
 // startingResolution keeps the selected starting size independent from the
 // automatic-fallback permission. A zero height means source dimensions, while
 // AutoResolution may be enabled or disabled for any starting choice.
-func startingResolution(request EncodeRequest, info VideoInfo) (width, height int, allowFallback bool) {
+func startingResolution(request EncodeRequest, info VideoInfo) (width, height int, allowFallback, encoderLimited bool) {
 	allowFallback = request.AutoResolution
-	if request.ResolutionHeight <= 0 {
-		return 0, 0, allowFallback
+	selectedWidth, selectedHeight := info.Width, info.Height
+	if request.ResolutionHeight > 0 {
+		width, height = scaleDimensions(info.Width, info.Height, request.ResolutionHeight)
+		if width > 0 && height > 0 {
+			selectedWidth, selectedHeight = width, height
+		}
 	}
-	width, height = scaleDimensions(info.Width, info.Height, request.ResolutionHeight)
-	return width, height, allowFallback
+	if limitedWidth, limitedHeight, limited := fitWithinEncoderLimit(
+		selectedWidth,
+		selectedHeight,
+		request.EncoderMaxLong,
+		request.EncoderMaxShort,
+	); limited {
+		return limitedWidth, limitedHeight, allowFallback, true
+	}
+	return width, height, allowFallback, false
+}
+
+// fitWithinEncoderLimit preserves the source aspect ratio while fitting both
+// portrait and landscape video inside a codec's probed frame envelope. Android
+// codec capabilities are commonly expressed as 1920x1080 even though the same
+// codec accepts the rotated 1080x1920 shape, so the limits are orientation-free.
+func fitWithinEncoderLimit(width, height, maxLongSide, maxShortSide int) (int, int, bool) {
+	if width <= 0 || height <= 0 || maxLongSide <= 0 || maxShortSide <= 0 {
+		return 0, 0, false
+	}
+	longSide, shortSide := max(width, height), min(width, height)
+	if longSide <= maxLongSide && shortSide <= maxShortSide {
+		return 0, 0, false
+	}
+	ratio := math.Min(float64(maxLongSide)/float64(longSide), float64(maxShortSide)/float64(shortSide))
+	limitedWidth := int(math.Floor(float64(width)*ratio)) &^ 1
+	limitedHeight := int(math.Floor(float64(height)*ratio)) &^ 1
+	if limitedWidth < 2 || limitedHeight < 2 {
+		return 0, 0, false
+	}
+	return limitedWidth, limitedHeight, true
 }
 
 func effectiveResolution(request EncodeRequest, info VideoInfo) (width, height int) {
@@ -1742,6 +1822,15 @@ func knownEncoders() []EncoderInfo {
 		// expected names so the option lights up as soon as a build has one.
 		{ID: "libavm", Codec: "av2", Name: "AVM AV2 software"},
 		{ID: "libaom-av2", Codec: "av2", Name: "libaom AV2 software"},
+		// Android MediaCodec (NDK) encoders. These are backed by the device's
+		// codec service when available and are filtered by detectWorkingHardware
+		// with a real three-frame encode probe at startup. They intentionally do
+		// not advertise two-pass mode: MediaCodec exposes bitrate control but not
+		// FFmpeg's pass-log workflow.
+		{ID: "h264_mediacodec", Codec: "h264", Name: "Android MediaCodec H.264", Hardware: true},
+		{ID: "hevc_mediacodec", Codec: "h265", Name: "Android MediaCodec H.265", Hardware: true},
+		{ID: "av1_mediacodec", Codec: "av1", Name: "Android MediaCodec AV1", Hardware: true},
+		{ID: "vp9_mediacodec", Codec: "vp9", Name: "Android MediaCodec VP9", Hardware: true},
 		// NVIDIA NVENC.
 		{ID: "h264_nvenc", Codec: "h264", Name: "NVIDIA NVENC H.264", Hardware: true},
 		{ID: "hevc_nvenc", Codec: "h265", Name: "NVIDIA NVENC H.265", Hardware: true},
@@ -1767,19 +1856,30 @@ func isVAAPIEncoder(id string) bool {
 	return strings.HasSuffix(id, "_vaapi")
 }
 
+func isMediaCodecEncoder(id string) bool {
+	return strings.HasSuffix(id, "_mediacodec")
+}
+
 // detectWorkingHardware runs a tiny test encode for every hardware encoder the
 // FFmpeg build advertises, because a build routinely lists NVENC, QSV, AMF, and
 // VAAPI encoders that the local GPU and drivers cannot actually run. It returns
 // the encoder IDs that produced frames, with the VAAPI device that worked.
-func detectWorkingHardware(ffmpeg string, available map[string]bool) (map[string]bool, map[string]string) {
+type encoderFrameLimit struct {
+	longSide  int
+	shortSide int
+}
+
+func detectWorkingHardware(ffmpeg string, available map[string]bool) (map[string]bool, map[string]string, map[string]encoderFrameLimit) {
 	working := make(map[string]bool)
 	vaapiDevices := make(map[string]string)
+	frameLimits := make(map[string]encoderFrameLimit)
 	renderNodes, _ := filepath.Glob("/dev/dri/renderD*")
 
 	type result struct {
-		id     string
-		device string
-		ok     bool
+		id         string
+		device     string
+		ok         bool
+		frameLimit encoderFrameLimit
 	}
 	var pending []EncoderInfo
 	for _, encoder := range knownEncoders() {
@@ -1806,7 +1906,12 @@ func detectWorkingHardware(ffmpeg string, available map[string]bool) (map[string
 				results <- result{id: id}
 				return
 			}
-			results <- result{id: id, ok: runHardwareProbe(ffmpeg, id, "")}
+			ok := runHardwareProbe(ffmpeg, id, "")
+			item := result{id: id, ok: ok}
+			if ok && id == "av1_mediacodec" {
+				item.frameLimit = detectMediaCodecFrameLimit(ffmpeg, id)
+			}
+			results <- item
 		}(encoder.ID)
 	}
 	wait.Wait()
@@ -1817,35 +1922,86 @@ func detectWorkingHardware(ffmpeg string, available map[string]bool) (map[string
 			if item.device != "" {
 				vaapiDevices[item.id] = item.device
 			}
+			if item.frameLimit.longSide > 0 && item.frameLimit.shortSide > 0 {
+				frameLimits[item.id] = item.frameLimit
+			}
 		}
 	}
-	return working, vaapiDevices
+	return working, vaapiDevices, frameLimits
 }
 
 // runHardwareProbe encodes three 720p frames; small frames sit below some
 // hardware minimum resolutions (AMD AV1 rejects anything under 256 lines).
 func runHardwareProbe(ffmpeg, encoderID, vaapiDevice string) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	return runHardwareProbeAtSize(ffmpeg, encoderID, vaapiDevice, 1280, 720)
+}
+
+// detectMediaCodecFrameLimit records the largest app-selectable resolution
+// class that the Android AV1 codec can actually configure. MediaCodec often
+// advertises an encoder through FFmpeg even when that implementation is the
+// platform's 1080p software codec, so a successful 720p availability probe is
+// not enough to safely accept a phone's native 1440p or 4K camera frames.
+func detectMediaCodecFrameLimit(ffmpeg, encoderID string) encoderFrameLimit {
+	for _, dimensions := range [][2]int{{3840, 2160}, {2560, 1440}, {1920, 1080}} {
+		if runHardwareProbeAtSize(ffmpeg, encoderID, "", dimensions[0], dimensions[1]) {
+			return encoderFrameLimit{longSide: dimensions[0], shortSide: dimensions[1]}
+		}
+	}
+	// The caller has already completed the base probe before reaching here.
+	return encoderFrameLimit{longSide: 1280, shortSide: 720}
+}
+
+func runHardwareProbeAtSize(ffmpeg, encoderID, vaapiDevice string, width, height int) bool {
+	probeTimeout := 20 * time.Second
+	if isMediaCodecEncoder(encoderID) {
+		// A MediaCodec service that cannot accept raw frames can otherwise hold
+		// FFmpeg in dequeueOutputBuffer until its global probe timeout. Keep
+		// Android startup responsive while still allowing a cold codec service
+		// enough time to initialize.
+		probeTimeout = 8 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
 	args := []string{"-hide_banner", "-v", "error", "-nostdin"}
 	if vaapiDevice != "" {
 		args = append(args, "-vaapi_device", vaapiDevice)
 	}
-	args = append(args, "-f", "lavfi", "-i", "color=black:size=1280x720:rate=30:duration=0.2")
+	if isMediaCodecEncoder(encoderID) {
+		// The Android payload intentionally omits the lavfi device/filter
+		// stack to keep the APK small. Feed a bounded three-frame probe from
+		// the platform's zero device instead; MediaCodec only needs valid raw
+		// YUV input and this also avoids a cold filter graph during startup.
+		args = append(args, "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", fmt.Sprintf("%dx%d", width, height), "-r", "30", "-i", "/dev/zero")
+	} else {
+		args = append(args, "-f", "lavfi", "-i", fmt.Sprintf("color=black:size=%dx%d:rate=30:duration=0.2", width, height))
+	}
 	if vaapiDevice != "" {
 		args = append(args, "-vf", "format=nv12,hwupload")
 	}
-	args = append(args, "-c:v", encoderID, "-b:v", "2M", "-frames:v", "3", "-f", "null", "-")
-	return exec.CommandContext(ctx, ffmpeg, args...).Run() == nil
+	args = append(args, "-c:v", encoderID)
+	if isMediaCodecEncoder(encoderID) {
+		// Current Android codec services need FFmpeg's asynchronous NDK callback
+		// mode. The Android build pins FFmpeg 8.1+, where this option is present;
+		// older desktop FFmpeg builds simply never advertise these IDs.
+		args = append(args, "-ndk_async", "1")
+	}
+	args = append(args, "-b:v", "2M", "-frames:v", "3", "-f", "null", "-")
+	command := exec.CommandContext(ctx, ffmpeg, args...)
+	configureBackgroundCommand(command)
+	return command.Run() == nil
 }
 
 func inspectFFmpeg(ffmpeg string) (AppStatus, map[string]string, error) {
-	versionOutput, err := exec.Command(ffmpeg, "-version").Output()
+	versionCommand := exec.Command(ffmpeg, "-version")
+	configureBackgroundCommand(versionCommand)
+	versionOutput, err := versionCommand.Output()
 	if err != nil {
 		return AppStatus{}, nil, errors.New("the bundled FFmpeg executable could not run")
 	}
 	firstLine := strings.SplitN(string(versionOutput), "\n", 2)[0]
-	encoderOutput, err := exec.Command(ffmpeg, "-hide_banner", "-encoders").CombinedOutput()
+	encoderCommand := exec.Command(ffmpeg, "-hide_banner", "-encoders")
+	configureBackgroundCommand(encoderCommand)
+	encoderOutput, err := encoderCommand.CombinedOutput()
 	if err != nil {
 		return AppStatus{}, nil, errors.New("could not inspect the bundled FFmpeg encoders")
 	}
@@ -1856,7 +2012,7 @@ func inspectFFmpeg(ffmpeg string) (AppStatus, map[string]string, error) {
 			available[fields[1]] = true
 		}
 	}
-	workingHardware, vaapiDevices := detectWorkingHardware(ffmpeg, available)
+	workingHardware, vaapiDevices, frameLimits := detectWorkingHardware(ffmpeg, available)
 	var encoders []EncoderInfo
 	for _, encoder := range knownEncoders() {
 		if !available[encoder.ID] {
@@ -1864,6 +2020,10 @@ func inspectFFmpeg(ffmpeg string) (AppStatus, map[string]string, error) {
 		}
 		if encoder.Hardware && !workingHardware[encoder.ID] {
 			continue
+		}
+		if limit := frameLimits[encoder.ID]; limit.longSide > 0 && limit.shortSide > 0 {
+			encoder.MaxLongSide = limit.longSide
+			encoder.MaxShortSide = limit.shortSide
 		}
 		encoders = append(encoders, encoder)
 	}

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#1b1c19" id="themeColor">
   <title>ExactSize</title>
@@ -100,6 +100,10 @@
                 <input id="outputPath" type="text" autocomplete="off" spellcheck="false" placeholder="Choose where to save the compressed video">
               </label>
               <button class="secondary-button" id="browseOutput" type="button">Browse…</button>
+            </div>
+            <div class="android-output-note" id="androidOutputNote" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h7l2 2h9v10H3V7z"/></svg>
+              <span><strong>Temporary app storage</strong><small>Choose where to save after compression finishes.</small></span>
             </div>
           </section>
 

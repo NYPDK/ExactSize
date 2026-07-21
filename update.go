@@ -11,12 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -157,7 +155,7 @@ func checkLatestRelease(ctx context.Context, client *http.Client, apiURL, curren
 	if !available {
 		return info, nil
 	}
-	expectedName := expectedAppImageName(latestVersion)
+	expectedName := expectedReleaseAssetName(latestVersion)
 	for _, asset := range release.Assets {
 		if asset.Name != expectedName || asset.State != "uploaded" {
 			continue
@@ -194,24 +192,24 @@ func (a *App) checkedUpdate(ctx context.Context) (UpdateInfo, error) {
 }
 
 func validateUpdateAsset(info UpdateInfo) error {
-	if info.AssetName != expectedAppImageName(info.LatestVersion) {
-		return errors.New("the release does not include the expected x86_64 AppImage")
+	if info.AssetName != expectedReleaseAssetName(info.LatestVersion) {
+		return errors.New("the release does not include the expected asset for this platform")
 	}
 	if info.AssetSize <= 0 || info.AssetSize > maxUpdateAssetSize {
-		return errors.New("the release AppImage has an invalid size")
+		return errors.New("the release asset has an invalid size")
 	}
 	digest := strings.TrimPrefix(info.AssetDigest, "sha256:")
 	decoded, err := hex.DecodeString(digest)
 	if err != nil || len(decoded) != sha256.Size || info.AssetDigest != "sha256:"+digest {
-		return errors.New("the release AppImage does not have a valid SHA-256 digest")
+		return errors.New("the release asset does not have a valid SHA-256 digest")
 	}
 	assetURL, err := url.Parse(info.AssetURL)
 	if err != nil || assetURL.Scheme != "https" || assetURL.Hostname() != "github.com" || assetURL.RawQuery != "" || assetURL.Fragment != "" {
-		return errors.New("the release AppImage has an untrusted download URL")
+		return errors.New("the release asset has an untrusted download URL")
 	}
 	wantPath := "/NYPDK/ExactSize/releases/download/" + info.tagName + "/" + info.AssetName
 	if assetURL.Path != wantPath {
-		return errors.New("the release AppImage URL does not match the release tag")
+		return errors.New("the release asset URL does not match the release tag")
 	}
 	return nil
 }
@@ -362,7 +360,7 @@ func runningAppImagePath() (string, error) {
 	if !info.Mode().IsRegular() {
 		return "", errors.New("the running AppImage path is not a regular file")
 	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok && stat.Uid != uint32(os.Geteuid()) {
+	if !appImageOwnedByCurrentUser(info) {
 		return "", errors.New("the running AppImage is not owned by the current user")
 	}
 	if err := validateAppImageMagic(resolved); err != nil {
@@ -508,17 +506,6 @@ func validateAppImageMagic(path string) error {
 		return errors.New("file is not an AppImage type-2 executable")
 	}
 	return nil
-}
-
-func openExternalURL(rawURL string) error {
-	if runtime.GOOS != "linux" {
-		return errors.New("opening links is currently supported on Linux only")
-	}
-	command, err := exec.LookPath("xdg-open")
-	if err != nil {
-		return errors.New("xdg-open is not available")
-	}
-	return exec.Command(command, rawURL).Start()
 }
 
 func defaultUpdateClient() *http.Client {

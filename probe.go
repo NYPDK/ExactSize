@@ -37,6 +37,7 @@ type VideoInfo struct {
 	SubtitleTracks     int     `json:"subtitleTracks"`
 	Format             string  `json:"format"`
 	audioStreams       []audioStreamInfo
+	normalizeAspect    bool
 }
 
 type audioStreamInfo struct {
@@ -44,21 +45,29 @@ type audioStreamInfo struct {
 	ChannelLayout string
 }
 
+type ffprobeStream struct {
+	CodecType     string            `json:"codec_type"`
+	CodecName     string            `json:"codec_name"`
+	Width         int               `json:"width"`
+	Height        int               `json:"height"`
+	RFrameRate    string            `json:"r_frame_rate"`
+	AvgFrameRate  string            `json:"avg_frame_rate"`
+	PixelFormat   string            `json:"pix_fmt"`
+	SampleAspect  string            `json:"sample_aspect_ratio"`
+	DisplayAspect string            `json:"display_aspect_ratio"`
+	Channels      int               `json:"channels"`
+	ChannelLayout string            `json:"channel_layout"`
+	SampleRate    string            `json:"sample_rate"`
+	BitRate       string            `json:"bit_rate"`
+	Tags          map[string]string `json:"tags"`
+	SideDataList  []struct {
+		Rotation float64 `json:"rotation"`
+	} `json:"side_data_list"`
+}
+
 type ffprobeDocument struct {
-	Streams []struct {
-		CodecType     string `json:"codec_type"`
-		CodecName     string `json:"codec_name"`
-		Width         int    `json:"width"`
-		Height        int    `json:"height"`
-		RFrameRate    string `json:"r_frame_rate"`
-		AvgFrameRate  string `json:"avg_frame_rate"`
-		PixelFormat   string `json:"pix_fmt"`
-		Channels      int    `json:"channels"`
-		ChannelLayout string `json:"channel_layout"`
-		SampleRate    string `json:"sample_rate"`
-		BitRate       string `json:"bit_rate"`
-	} `json:"streams"`
-	Format struct {
+	Streams []ffprobeStream `json:"streams"`
+	Format  struct {
 		Duration   string `json:"duration"`
 		Size       string `json:"size"`
 		FormatName string `json:"format_name"`
@@ -82,10 +91,11 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 	defer cancel()
 	command := exec.CommandContext(ctx, ffprobe,
 		"-v", "error",
-		"-show_entries", "format=duration,size,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,channels,channel_layout,sample_rate,bit_rate",
+		"-show_entries", "format=duration,size,format_name:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,pix_fmt,sample_aspect_ratio,display_aspect_ratio,channels,channel_layout,sample_rate,bit_rate:stream_tags=rotate:stream_side_data=rotation",
 		"-of", "json",
 		path,
 	)
+	configureBackgroundCommand(command)
 	output, err := command.Output()
 	if err != nil {
 		return VideoInfo{}, errors.New("ffprobe could not read this file as a video")
@@ -113,8 +123,7 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 		case "video":
 			if info.VideoCodec == "" {
 				info.VideoCodec = stream.CodecName
-				info.Width = stream.Width
-				info.Height = stream.Height
+				info.Width, info.Height, info.normalizeAspect = displayGeometry(stream)
 				info.PixelFormat = stream.PixelFormat
 				info.FPS = parseRate(stream.AvgFrameRate)
 				if info.FPS == 0 {
@@ -162,6 +171,62 @@ func probeVideo(parent context.Context, ffprobe, path string) (VideoInfo, error)
 	return info, nil
 }
 
+// displayGeometry returns the square-pixel dimensions seen after FFmpeg's
+// automatic display-matrix rotation. Scaling filters run after that rotation,
+// so using coded dimensions here would stretch a portrait frame into the
+// unrotated landscape shape. Non-square source pixels are normalized as well;
+// appendVideoFilters emits the matching normalization scale when needed.
+func displayGeometry(stream ffprobeStream) (width, height int, normalizeAspect bool) {
+	width, height = stream.Width, stream.Height
+	if numerator, denominator, ok := parseRatio(stream.SampleAspect); ok && numerator != denominator {
+		width = int(math.Round(float64(width) * float64(numerator) / float64(denominator)))
+		normalizeAspect = width > 0
+	} else if numerator, denominator, ok := parseRatio(stream.DisplayAspect); ok && width > 0 && height > 0 {
+		displayWidth := int(math.Round(float64(height) * float64(numerator) / float64(denominator)))
+		if displayWidth != width {
+			width = displayWidth
+			normalizeAspect = width > 0
+		}
+	}
+	if normalizeAspect {
+		if width > 1 && width%2 != 0 {
+			width++
+		}
+	}
+	rotation := 0.0
+	for _, sideData := range stream.SideDataList {
+		if sideData.Rotation != 0 {
+			rotation = sideData.Rotation
+			break
+		}
+	}
+	if rotation == 0 && stream.Tags != nil {
+		rotation, _ = strconv.ParseFloat(strings.TrimSpace(stream.Tags["rotate"]), 64)
+	}
+	rotation = math.Mod(rotation, 360)
+	if rotation < 0 {
+		rotation += 360
+	}
+	if math.Abs(rotation-90) < 0.5 || math.Abs(rotation-270) < 0.5 {
+		width, height = height, width
+	}
+	return width, height, normalizeAspect
+}
+
+func parseRatio(value string) (numerator, denominator int, ok bool) {
+	separator := ":"
+	if strings.Contains(value, "/") {
+		separator = "/"
+	}
+	parts := strings.SplitN(strings.TrimSpace(value), separator, 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	numerator, numeratorErr := strconv.Atoi(parts[0])
+	denominator, denominatorErr := strconv.Atoi(parts[1])
+	return numerator, denominator, numeratorErr == nil && denominatorErr == nil && numerator > 0 && denominator > 0
+}
+
 func probeAudioPacketBitrate(ctx context.Context, ffprobe, path string) int {
 	command := exec.CommandContext(ctx, ffprobe,
 		"-v", "error",
@@ -172,6 +237,7 @@ func probeAudioPacketBitrate(ctx context.Context, ffprobe, path string) int {
 		"-of", "csv=p=0",
 		path,
 	)
+	configureBackgroundCommand(command)
 	output, err := command.Output()
 	if err != nil {
 		return 0
@@ -244,6 +310,7 @@ func probeOutputBreakdown(parent context.Context, ffprobe, path string) (OutputB
 		"-of", "csv=p=0",
 		path,
 	)
+	configureBackgroundCommand(command)
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		return OutputBreakdown{}, fmt.Errorf("measure encoded output: %w", err)

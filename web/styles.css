@@ -82,7 +82,6 @@
 }
 
 html {
-  min-width: 1024px;
   min-height: 100%;
   background: var(--bg);
 }
@@ -544,15 +543,38 @@ select {
   transition: background-color 150ms ease, border-color 150ms ease;
 }
 
-input:hover,
-select:hover {
+input:hover {
   background: var(--control-hover);
   border-color: var(--border-strong);
 }
 
+/* Native select menus keep the control focused after their popup closes, and
+   touch browsers can also leave :hover latched. Only show dropdown hover on a
+   real hover-capable pointer while the select is not focused. Keyboard focus
+   remains visible through :focus-visible without leaving a mouse/touch click
+   treatment stuck on the closed dropdown. */
+@media (hover: hover) and (pointer: fine) {
+  select:hover:not(:focus) {
+    background: var(--control-hover);
+    border-color: var(--border-strong);
+  }
+}
+
 input:focus,
-select:focus {
+select:focus-visible {
   border-color: var(--accent);
+}
+
+select:focus:not(:focus-visible) {
+  background: var(--input);
+  border-color: var(--border);
+}
+
+html[data-input-modality="pointer"] select:focus,
+html[data-input-modality="pointer"] select:focus-visible {
+  background: var(--input);
+  border-color: var(--border);
+  outline: none;
 }
 
 input {
@@ -1200,6 +1222,433 @@ select {
 
 [hidden] {
   display: none !important;
+}
+
+/* Android is a fixed, single-screen control surface. The native activity
+   removes the status/navigation-bar insets before this viewport is measured;
+   the small fit transform is a final guard for unusual font or display sizes. */
+html[data-platform="android"],
+html[data-platform="android"] body {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+
+html[data-platform="android"] body {
+  font-size: 13px;
+}
+
+html[data-platform="android"] .app-shell {
+  position: absolute;
+  top: 0;
+  left: 0;
+  min-height: 0;
+  overflow: hidden;
+  transform-origin: top left;
+}
+
+html[data-platform="android"] .app-header {
+  position: relative;
+  height: 40px;
+  padding: 0 10px;
+}
+
+html[data-platform="android"] .brand {
+  gap: 7px;
+}
+
+html[data-platform="android"] .brand-mark {
+  width: 26px;
+  height: 26px;
+}
+
+html[data-platform="android"] .brand-name {
+  font-size: 15px;
+}
+
+html[data-platform="android"] .runtime-status {
+  gap: 7px;
+  margin-left: 12px;
+  padding-left: 12px;
+  font-size: 12px;
+}
+
+html[data-platform="android"] .window-actions {
+  gap: 2px;
+}
+
+html[data-platform="android"] .icon-button {
+  width: 34px;
+  height: 34px;
+}
+
+html[data-platform="android"] .workspace {
+  width: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 6px;
+}
+
+html[data-platform="android"] .deck {
+  min-height: 0;
+  grid-template-columns: 1fr;
+  grid-auto-rows: max-content;
+  align-content: start;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+html[data-platform="android"] .job-column {
+  display: contents;
+}
+
+/* Keep the primary action below every setting on a phone. Flattening the
+   desktop job column lets the Android grid order the action after step 4
+   without changing the desktop DOM or its two-column layout. */
+html[data-platform="android"] .input-section {
+  order: 1;
+}
+
+html[data-platform="android"] .target-section {
+  order: 2;
+}
+
+html[data-platform="android"] .output-section {
+  order: 3;
+}
+
+html[data-platform="android"] .settings-section {
+  order: 4;
+}
+
+html[data-platform="android"] .action-row {
+  order: 5;
+}
+
+html[data-platform="android"] .input-section,
+html[data-platform="android"] .input-section .drop-zone {
+  flex: 0 0 auto;
+}
+
+html[data-platform="android"] .workflow-section,
+html[data-platform="android"] .progress-panel {
+  padding: 10px 12px;
+}
+
+html[data-platform="android"] .section-label {
+  gap: 8px;
+  margin-bottom: 7px;
+  font-size: 14px;
+}
+
+html[data-platform="android"] .step-number {
+  width: 22px;
+  height: 22px;
+  font-size: 10px;
+}
+
+html[data-platform="android"] .drop-zone {
+  min-height: 58px;
+  padding: 7px 11px;
+}
+
+html[data-platform="android"] .drop-icon {
+  width: 36px;
+  height: 36px;
+  margin-right: 10px;
+}
+
+html[data-platform="android"] .drop-icon svg {
+  width: 22px;
+  height: 22px;
+}
+
+html[data-platform="android"] .drop-copy strong,
+html[data-platform="android"] .file-name {
+  font-size: 14px;
+}
+
+html[data-platform="android"] .drop-copy span,
+html[data-platform="android"] .file-meta,
+html[data-platform="android"] .change-file {
+  font-size: 11px;
+}
+
+html[data-platform="android"] .size-presets {
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+html[data-platform="android"] .size-presets button {
+  height: 32px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+html[data-platform="android"] input,
+html[data-platform="android"] select {
+  height: 34px;
+}
+
+html[data-platform="android"] .target-value-field input {
+  width: 100px;
+  font-size: 13px;
+}
+
+html[data-platform="android"] .unit-field select {
+  width: 72px;
+}
+
+html[data-platform="android"] .strict-note {
+  display: flex;
+  margin-left: 2px;
+  font-size: 11px;
+}
+
+html[data-platform="android"] .output-controls {
+  display: none;
+}
+
+html[data-platform="android"] .android-output-note:not([hidden]) {
+  display: flex;
+  min-height: 42px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  color: var(--muted);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+html[data-platform="android"] .android-output-note svg {
+  flex: 0 0 auto;
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.7;
+}
+
+html[data-platform="android"] .android-output-note span,
+html[data-platform="android"] .android-output-note small {
+  display: block;
+  min-width: 0;
+}
+
+html[data-platform="android"] .android-output-note strong {
+  color: var(--text);
+  font-size: 12px;
+}
+
+html[data-platform="android"] .android-output-note small {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+html[data-platform="android"] .action-row {
+  gap: 6px;
+}
+
+html[data-platform="android"] .compress-button,
+html[data-platform="android"] .remux-button {
+  height: 42px;
+  font-size: 14px;
+}
+
+html[data-platform="android"] .settings-groups {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  align-items: start;
+}
+
+html[data-platform="android"] .settings-group {
+  padding: 5px 10px 7px;
+}
+
+html[data-platform="android"] .settings-group legend {
+  gap: 7px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+html[data-platform="android"] .settings-group legend svg {
+  width: 16px;
+  height: 16px;
+}
+
+html[data-platform="android"] .field-row {
+  grid-template-columns: minmax(112px, .6fr) minmax(0, 1.4fr);
+  gap: 8px;
+  min-height: 36px;
+  font-size: 12px;
+}
+
+html[data-platform="android"] .field-row select {
+  min-width: 0;
+  padding-right: 28px;
+  padding-left: 10px;
+  font-size: 12px;
+}
+
+html[data-platform="android"] .frame-rate-control {
+  grid-template-columns: minmax(100px, 1fr) minmax(112px, auto);
+  gap: 8px;
+}
+
+html[data-platform="android"] .audio-bitrate-control {
+  grid-template-columns: minmax(100px, 1fr) minmax(64px, auto);
+}
+
+html[data-platform="android"] .frame-rate-control output {
+  font-size: 11px;
+}
+
+html[data-platform="android"] .toggle-row {
+  gap: 8px;
+  min-height: 34px;
+}
+
+html[data-platform="android"] .toggle {
+  width: 34px;
+  height: 20px;
+}
+
+html[data-platform="android"] .toggle::after {
+  width: 14px;
+  height: 14px;
+}
+
+html[data-platform="android"] .toggle-row input:checked + .toggle::after {
+  transform: translateX(14px);
+}
+
+html[data-platform="android"] .toggle-row strong {
+  font-size: 12px;
+}
+
+html[data-platform="android"] .toggle-row small {
+  display: none;
+}
+
+html[data-platform="android"] .audio-info {
+  gap: 6px;
+  padding: 5px 8px;
+  font-size: 10px;
+  line-height: 1.3;
+}
+
+html[data-platform="android"] .audio-info svg {
+  width: 15px;
+  height: 15px;
+}
+
+html[data-platform="android"] .bitrate-estimate {
+  margin-top: 6px;
+  padding-top: 6px;
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+html[data-platform="android"] .progress-panel {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+}
+
+html[data-platform="android"] .progress-identity {
+  grid-row: 1;
+  grid-column: 1;
+  min-width: 0;
+}
+
+html[data-platform="android"] .progress-actions {
+  grid-row: 1;
+  grid-column: 2;
+}
+
+html[data-platform="android"] .progress-actions .secondary-button {
+  height: 32px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+html[data-platform="android"] .progress-body {
+  grid-row: 2;
+  grid-column: 1 / -1;
+}
+
+html[data-platform="android"] .progress-track {
+  height: 16px;
+}
+
+html[data-platform="android"] .progress-stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, auto));
+  justify-content: start;
+  gap: 0;
+  margin-top: 3px;
+  overflow: hidden;
+}
+
+html[data-platform="android"] .stat {
+  min-width: 0;
+  padding: 0 7px;
+}
+
+html[data-platform="android"] .stat:first-child {
+  padding-left: 0;
+}
+
+html[data-platform="android"] .stat span {
+  font-size: 9px;
+}
+
+html[data-platform="android"] .stat strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+}
+
+html[data-platform="android"] .progress-message {
+  display: none;
+}
+
+html[data-platform="android"] .toast {
+  right: 8px;
+  bottom: 8px;
+  left: 8px;
+  max-width: none;
+  font-size: 11px;
+}
+
+html[data-platform="android"] .error-float {
+  bottom: 8px;
+  width: calc(100vw - 16px);
+}
+
+/* Chromium positions its native range thumb a few pixels inward and lower
+   than the full-size input box. Match the custom rail to those thumb centers
+   so both handles sit on the visible line instead of below/inside it. */
+html[data-platform="android"] .frame-rate-track,
+html[data-platform="android"] .frame-rate-selection {
+  top: calc(50% + 5px);
+}
+
+html[data-platform="android"] .frame-rate-track {
+  right: 6px;
+  left: 6px;
+}
+
+html[data-platform="android"] .frame-rate-selection {
+  margin-right: 6px;
+  margin-left: 6px;
 }
 
 @media (max-width: 1020px) {

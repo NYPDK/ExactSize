@@ -1,6 +1,9 @@
 "use strict";
 
 const token = new URLSearchParams(window.location.search).get("token") || "";
+const androidBridge = window.ExactSizeAndroid?.saveOutput ? window.ExactSizeAndroid : null;
+
+if (androidBridge) document.documentElement.dataset.platform = "android";
 
 const $ = (id) => document.getElementById(id);
 
@@ -63,6 +66,7 @@ const elements = {
   bitrateEstimate: $("bitrateEstimate"),
   outputPath: $("outputPath"),
   browseOutput: $("browseOutput"),
+  androidOutputNote: $("androidOutputNote"),
   compressButton: $("compressButton"),
   remuxButton: $("remuxButton"),
   progressPanel: $("progressPanel"),
@@ -165,6 +169,7 @@ async function api(path, options = {}) {
 
 async function initialize() {
   applyTheme("dark");
+  trackInputModality();
   bindEvents();
   setRuntime("Starting…", "busy");
   try {
@@ -172,6 +177,15 @@ async function initialize() {
     if (state.appStatus.version) {
       elements.appVersion.textContent = `v${state.appStatus.version}`;
       elements.appVersion.hidden = false;
+    }
+    if (androidBridge) {
+      elements.outputPath.readOnly = true;
+      elements.showOutputButton.textContent = "Save output";
+      elements.androidOutputNote.hidden = false;
+      elements.emptyInputCopy.querySelector("strong").textContent = "Choose a video";
+      elements.emptyInputCopy.querySelector("span").textContent = "Tap to browse your device";
+      elements.changeFile.textContent = "Change video";
+      elements.quitButton.hidden = true;
     }
     if (!state.appStatus.encoders?.length) {
       throw new Error("The bundled FFmpeg build has no supported video encoders.");
@@ -181,13 +195,39 @@ async function initialize() {
     refreshFrameRateControl(true);
     setupFramelessWindow();
     updateSizePresetSelection();
-    setRuntime("Ready", "ready");
     updateFormState();
-    void checkForUpdates();
+    const currentJob = await api("/api/jobs/current");
+    const activeJob = ["queued", "running"].includes(currentJob.state);
+    const terminalJob = ["completed", "failed", "canceled"].includes(currentJob.state);
+    if (currentJob.output) elements.outputPath.value = currentJob.output;
+    if (activeJob) {
+      setEncodingState(true);
+      renderJob(currentJob);
+      void pollJob();
+    } else if (terminalJob) {
+      renderJob(currentJob);
+    } else {
+      setRuntime("Ready", "ready");
+    }
+    // Android APK replacement must go through its package installer and
+    // signing chain; the desktop release-asset updater is not valid there.
+    if (!androidBridge) void checkForUpdates();
+    scheduleAndroidFit();
   } catch (error) {
     setRuntime("FFmpeg error", "error");
     showError(error);
   }
+}
+
+function trackInputModality() {
+  const root = document.documentElement;
+  document.addEventListener("pointerdown", () => {
+    root.dataset.inputModality = "pointer";
+  }, true);
+  document.addEventListener("keydown", (event) => {
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    root.dataset.inputModality = "keyboard";
+  }, true);
 }
 
 function applyTheme(theme) {
@@ -472,7 +512,7 @@ function handleFrameRateInput(activeHandle) {
 }
 
 function setupFramelessWindow() {
-  const frameless = Boolean(state.appStatus?.frameless);
+  const frameless = !androidBridge && Boolean(state.appStatus?.frameless);
   document.documentElement.classList.toggle("frameless", frameless);
   elements.minimizeButton.hidden = !frameless;
   elements.resizeGrip.hidden = !frameless;
@@ -648,7 +688,10 @@ function droppedFilePaths(values) {
       try {
         const uri = new URL(line);
         if (uri.protocol !== "file:" || (uri.hostname && uri.hostname !== "localhost")) continue;
-        const path = decodeURIComponent(uri.pathname);
+        let path = decodeURIComponent(uri.pathname);
+        // Windows file URIs expose drive paths as /C:/..., while every path
+        // returned by the desktop API uses the C:/... form.
+        if (/^\/[A-Za-z]:\//.test(path)) path = path.slice(1);
         if (path && !seen.has(path)) {
           seen.add(path);
           paths.push(path);
@@ -700,6 +743,10 @@ async function loadInputPath(path, displayName, isTemp = false) {
     updateEstimate();
     updateFormState();
     setRuntime("Ready", "ready");
+    // Fit once the probe and all dependent controls have rendered. Measuring
+    // the loading placeholder first can leave Android with a stale transform
+    // while the real settings are being inserted.
+    scheduleAndroidFit();
     return true;
   } catch (error) {
     state.input = null;
@@ -737,6 +784,7 @@ function renderInput() {
     ? `${info.audioTracks} audio ${info.audioTracks === 1 ? "track" : "tracks"} will be retained and re-encoded.`
     : "This video has no audio tracks.";
   elements.audioInfo.textContent = audioDescription;
+  scheduleAndroidFit();
 }
 
 function resetInputDisplay() {
@@ -747,6 +795,7 @@ function resetInputDisplay() {
   refreshResolutionOptions();
   refreshFrameRateControl(true);
   updateFormState();
+  scheduleAndroidFit();
 }
 
 function chooseSensibleDefaults(info) {
@@ -866,6 +915,10 @@ function setSuggestedOutput() {
 
 async function chooseOutput() {
   if (state.encoding) return;
+  if (androidBridge) {
+    showToast("Android saves the finished video in app storage first. Use Save output when encoding completes.");
+    return;
+  }
   let suggested = elements.outputPath.value.trim();
   if (!suggested && state.input) {
     setSuggestedOutput();
@@ -939,7 +992,11 @@ async function pollJob() {
     renderJob(job);
     if (["completed", "failed", "canceled"].includes(job.state)) {
       setEncodingState(false);
-      if (job.state === "completed") showToast(`Saved ${formatBytes(job.encodedBytes)} output`);
+      if (job.state === "completed") {
+        showToast(androidBridge
+          ? `Compression complete (${formatBytes(job.encodedBytes)}). Choose Save output.`
+          : `Saved ${formatBytes(job.encodedBytes)} output`);
+      }
       return;
     }
   } catch (error) {
@@ -1039,6 +1096,8 @@ function progressMetric(job) {
 
 function setEncodingState(encoding) {
   state.encoding = encoding;
+  document.body.classList.toggle("is-encoding", encoding);
+  if (androidBridge?.setEncoding) androidBridge.setEncoding(encoding);
   const controls = document.querySelectorAll(".workflow-section input, .workflow-section select, .workflow-section button, #compressButton");
   controls.forEach((control) => { control.disabled = encoding; });
   if (!encoding) {
@@ -1048,9 +1107,16 @@ function setEncodingState(encoding) {
     updateFormState();
   }
   setRuntime(encoding ? "Encoding" : "Ready", encoding ? "busy" : "ready");
+  // The Android shell is already fitted after the input/layout pass. Avoid
+  // resetting its transform while FFmpeg starts or finishes; that visible
+  // measurement pass can briefly paint a malformed intermediate layout.
 }
 
 async function showOutput() {
+  if (androidBridge) {
+    androidBridge.saveOutput(elements.outputPath.value.trim());
+    return;
+  }
   try {
     await api("/api/reveal", {
       method: "POST",
@@ -1383,5 +1449,49 @@ function formatPixelFormat(pixelFormat) {
 function trimNumber(number, digits) {
   return Number(number.toFixed(digits)).toString();
 }
+
+let androidFitFrame = 0;
+
+function scheduleAndroidFit() {
+  if (!androidBridge || androidFitFrame) return;
+  androidFitFrame = window.requestAnimationFrame(() => {
+    androidFitFrame = 0;
+    fitAndroidLayout();
+  });
+}
+
+function fitAndroidLayout() {
+  const shell = document.querySelector(".app-shell");
+  if (!shell) return;
+
+  const viewportWidth = document.documentElement.clientWidth;
+  const viewportHeight = document.documentElement.clientHeight;
+  if (!viewportWidth || !viewportHeight) return;
+
+  shell.style.transform = "none";
+  shell.style.width = `${viewportWidth}px`;
+  shell.style.height = "auto";
+  shell.style.minHeight = "0";
+
+  let scale = 1;
+  for (let iteration = 0; iteration < 6; iteration += 1) {
+    shell.style.width = `${viewportWidth / scale}px`;
+    const requiredHeight = shell.scrollHeight;
+    const nextScale = Math.min(1, viewportHeight / Math.max(requiredHeight, 1));
+    if (Math.abs(nextScale - scale) < .002) {
+      scale = nextScale;
+      break;
+    }
+    scale = nextScale;
+  }
+
+  scale = Math.max(.25, Math.min(1, scale));
+  shell.style.width = `${viewportWidth / scale}px`;
+  shell.style.height = `${viewportHeight / scale}px`;
+  shell.style.transform = `scale(${scale})`;
+  document.documentElement.dataset.fitScale = scale.toFixed(3);
+}
+
+window.addEventListener("resize", scheduleAndroidFit);
 
 initialize();
