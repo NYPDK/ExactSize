@@ -488,9 +488,9 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	}
 	chainInfo, err := probeVideo(j.ctx, ffprobe, chainInput)
 	if err != nil {
-		return err
+		return fmt.Errorf("probe recompression intermediate: %w", err)
 	}
-	startKbps, err := chainStartKbps(j.request.TargetBytes, chainInfo.Duration, artifact, encoder.Hardware)
+	startKbps, err := chainStartKbps(j.request.TargetBytes, chainInfo.Duration, artifact)
 	if err != nil {
 		return err
 	}
@@ -1657,15 +1657,13 @@ func chainOrFail(opts ladderOptions, artifact *overTargetArtifact, failure error
 // chainStartKbps seeds the recompression generation's bitrate from the
 // intermediate's measured stream breakdown; a zero result tells the ladder to
 // fall back to its own calculateVideoBitrate estimate because the breakdown
-// probe failed.
-func chainStartKbps(targetBytes int64, duration float64, artifact *overTargetArtifact, hardware bool) (int, error) {
+// probe failed. The ladder's own prelude applies hardwareSafeBitrate to
+// whatever this returns, so it is not applied here too.
+func chainStartKbps(targetBytes int64, duration float64, artifact *overTargetArtifact) (int, error) {
 	if !artifact.hasBreakdown {
 		return 0, nil
 	}
 	kbps := outputVideoBudgetKbps(targetBytes, duration, artifact.breakdown)
-	if hardware {
-		kbps = hardwareSafeBitrate(kbps)
-	}
 	if kbps < minimumVideoBitrateKbps {
 		return 0, errors.New("the target is too small after measured audio and container overhead")
 	}

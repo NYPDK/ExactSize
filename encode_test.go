@@ -952,6 +952,232 @@ printf 'out_time_us=10000000\nprogress=end\n'
 	}
 }
 
+func TestRecompressionFallbackProbeFailureIsWrapped(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "input.mp4")
+	output := filepath.Join(tempDir, "output.mp4")
+	if err := os.WriteFile(input, []byte("fake input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	probeDocument := `{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","pix_fmt":"yuv420p"}],"format":{"duration":"10","size":"10","format_name":"mov,mp4"}}`
+	probeFile := filepath.Join(tempDir, "probe-count")
+	t.Setenv("EXACTSIZE_TEST_PROBE_FILE", probeFile)
+	ffprobe := filepath.Join(tempDir, "fake-ffprobe")
+	// Invocation 1 probes the source and must succeed so the run gets under
+	// way. Every later invocation fails: the ladder's own output-breakdown
+	// probes during generation 1 tolerate that, but the chain re-probe after
+	// generation 1 hands back an over-target artifact must not.
+	ffprobeScript := `#!/bin/sh
+count=0
+if [ -f "$EXACTSIZE_TEST_PROBE_FILE" ]; then
+  read count < "$EXACTSIZE_TEST_PROBE_FILE"
+fi
+count=$((count + 1))
+printf '%s\n' "$count" > "$EXACTSIZE_TEST_PROBE_FILE"
+if [ "$count" -eq 1 ]; then
+  printf '%s\n' '` + probeDocument + `'
+else
+  exit 1
+fi
+`
+	if err := os.WriteFile(ffprobe, []byte(ffprobeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	attemptFile := filepath.Join(tempDir, "attempt")
+	t.Setenv("EXACTSIZE_TEST_ATTEMPT_FILE", attemptFile)
+	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
+	ffmpegScript := `#!/bin/sh
+attempt=0
+if [ -f "$EXACTSIZE_TEST_ATTEMPT_FILE" ]; then
+  read attempt < "$EXACTSIZE_TEST_ATTEMPT_FILE"
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$EXACTSIZE_TEST_ATTEMPT_FILE"
+for output do :; done
+truncate -s 11000000 "$output"
+printf 'out_time_us=10000000\nprogress=end\n'
+`
+	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	request := validTestRequest()
+	request.Input = input
+	request.Output = output
+	request.TargetBytes = 10_000_000
+	request.AudioCodec = "none"
+	request.AudioBitrateKbps = 0
+	request.TwoPass = false
+	job := newJob(request)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	job.ctx = ctx
+	job.cancel = cancel
+
+	err := job.runEncode(ffmpeg, ffprobe)
+	if err == nil || !strings.Contains(err.Error(), "probe recompression intermediate:") {
+		t.Fatalf("expected wrapped chain probe error, got %v", err)
+	}
+}
+
+func TestRecompressionFallbackCopiesAudio(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "input.mp4")
+	output := filepath.Join(tempDir, "output.mp4")
+	if err := os.WriteFile(input, []byte("fake input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ffprobe := filepath.Join(tempDir, "fake-ffprobe")
+	probeDocument := `{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","pix_fmt":"yuv420p"},{"codec_type":"audio","codec_name":"aac","channels":2,"sample_rate":"48000","bit_rate":"128000"}],"format":{"duration":"10","size":"10","format_name":"mov,mp4"}}`
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s\\n' '"+probeDocument+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	attemptFile := filepath.Join(tempDir, "attempt")
+	argsLog := filepath.Join(tempDir, "args.log")
+	t.Setenv("EXACTSIZE_TEST_ATTEMPT_FILE", attemptFile)
+	t.Setenv("EXACTSIZE_TEST_ARGS_LOG", argsLog)
+	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
+	ffmpegScript := `#!/bin/sh
+attempt=0
+if [ -f "$EXACTSIZE_TEST_ATTEMPT_FILE" ]; then
+  read attempt < "$EXACTSIZE_TEST_ATTEMPT_FILE"
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$EXACTSIZE_TEST_ATTEMPT_FILE"
+printf '%s\n' "$*" >> "$EXACTSIZE_TEST_ARGS_LOG"
+for output do :; done
+if [ "$attempt" -lt 3 ]; then
+  truncate -s 11000000 "$output"
+  printf 'out_time_us=10000000\nprogress=end\n'
+elif [ "$attempt" -eq 3 ]; then
+  truncate -s 12000000 "$output"
+  printf 'out_time_us=1000000\nprogress=end\n'
+else
+  truncate -s 9000000 "$output"
+  printf 'out_time_us=10000000\nprogress=end\n'
+fi
+`
+	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	request := validTestRequest()
+	request.Input = input
+	request.Output = output
+	request.TargetBytes = 10_000_000
+	request.AudioCodec = "aac"
+	request.AudioBitrateKbps = 128
+	request.AudioChannels = "stereo"
+	request.TwoPass = false
+	job := newJob(request)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	job.ctx = ctx
+	job.cancel = cancel
+
+	if err := job.runEncode(ffmpeg, ffprobe); err != nil {
+		t.Fatalf("fallback run failed: %v", err)
+	}
+	status := job.snapshot()
+	if status.State != "completed" {
+		t.Fatalf("expected job to complete, got %+v", status)
+	}
+	logBytes, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(logBytes)), "\n")
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 ffmpeg invocations, got %d:\n%s", len(lines), logBytes)
+	}
+	for _, line := range lines[:3] {
+		if !strings.Contains(line, "-c:a aac") {
+			t.Fatalf("generation 1 should encode audio with aac: %s", line)
+		}
+	}
+	if !strings.Contains(lines[3], "-c:a copy") {
+		t.Fatalf("generation 2 should copy the already-encoded audio: %s", lines[3])
+	}
+	if strings.Contains(lines[3], "-b:a") {
+		t.Fatalf("generation 2 audio copy must not request a bitrate: %s", lines[3])
+	}
+}
+
+func TestRecompressionMonitorStaysEnabledInGenerationTwo(t *testing.T) {
+	tempDir := t.TempDir()
+	input := filepath.Join(tempDir, "input.mp4")
+	output := filepath.Join(tempDir, "output.mp4")
+	if err := os.WriteFile(input, []byte("fake input"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ffprobe := filepath.Join(tempDir, "fake-ffprobe")
+	probeDocument := `{"streams":[{"codec_type":"video","codec_name":"h264","width":1920,"height":1080,"avg_frame_rate":"30/1","pix_fmt":"yuv420p"}],"format":{"duration":"10","size":"10","format_name":"mov,mp4"}}`
+	if err := os.WriteFile(ffprobe, []byte("#!/bin/sh\nprintf '%s\\n' '"+probeDocument+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	attemptFile := filepath.Join(tempDir, "attempt")
+	t.Setenv("EXACTSIZE_TEST_ATTEMPT_FILE", attemptFile)
+	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
+	// Attempts 1-3 exhaust generation 1 over target, chaining into generation
+	// 2. Attempt 4 reports an early over-target sample and then hangs, the
+	// shape the live output-size monitor kills; attempt 5 completes under
+	// target. If the monitor were disabled in generation 2, attempt 4 would
+	// instead run to completion over target and fail the whole job.
+	ffmpegScript := `#!/bin/sh
+attempt=0
+if [ -f "$EXACTSIZE_TEST_ATTEMPT_FILE" ]; then
+  read attempt < "$EXACTSIZE_TEST_ATTEMPT_FILE"
+fi
+attempt=$((attempt + 1))
+printf '%s\n' "$attempt" > "$EXACTSIZE_TEST_ATTEMPT_FILE"
+for output do :; done
+if [ "$attempt" -le 3 ]; then
+  truncate -s 11000000 "$output"
+  printf 'out_time_us=10000000\nprogress=end\n'
+elif [ "$attempt" -eq 4 ]; then
+  truncate -s 12000000 "$output"
+  printf 'out_time_us=1000000\n'
+  exec sleep 10
+else
+  truncate -s 9000000 "$output"
+  printf 'out_time_us=10000000\nprogress=end\n'
+fi
+`
+	if err := os.WriteFile(ffmpeg, []byte(ffmpegScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	request := validTestRequest()
+	request.Input = input
+	request.Output = output
+	request.TargetBytes = 10_000_000
+	request.AudioCodec = "none"
+	request.AudioBitrateKbps = 0
+	request.TwoPass = false
+	job := newJob(request)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	job.ctx = ctx
+	job.cancel = cancel
+
+	if err := job.runEncode(ffmpeg, ffprobe); err != nil {
+		t.Fatalf("fallback run failed: %v", err)
+	}
+	status := job.snapshot()
+	if status.State != "completed" {
+		t.Fatalf("expected job to complete, got %+v", status)
+	}
+	if stat, err := os.Stat(output); err != nil || stat.Size() != 9_000_000 {
+		t.Fatalf("published output = %v, %v; want 9000000 bytes", stat, err)
+	}
+}
+
 func TestRunFFmpegPreservesUsefulCorrectionMessage(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake ffmpeg helper is a Unix shell script")
@@ -1692,7 +1918,7 @@ func TestChainOrFailRoutesArtifactsAndSuffixes(t *testing.T) {
 
 func TestChainStartKbpsUsesMeasuredBreakdown(t *testing.T) {
 	noBreakdown := &overTargetArtifact{actualBytes: 12_000_000}
-	kbps, err := chainStartKbps(10_000_000, 10, noBreakdown, false)
+	kbps, err := chainStartKbps(10_000_000, 10, noBreakdown)
 	if err != nil || kbps != 0 {
 		t.Fatalf("no breakdown = %d, %v; want 0, nil", kbps, err)
 	}
@@ -1703,13 +1929,9 @@ func TestChainStartKbpsUsesMeasuredBreakdown(t *testing.T) {
 		breakdown:    OutputBreakdown{AudioBytes: 1_000_000, MuxBytes: 200_000},
 	}
 	want := outputVideoBudgetKbps(10_000_000, 10, measured.breakdown)
-	kbps, err = chainStartKbps(10_000_000, 10, measured, false)
+	kbps, err = chainStartKbps(10_000_000, 10, measured)
 	if err != nil || kbps != want {
 		t.Fatalf("software budget = %d, %v; want %d", kbps, err, want)
-	}
-	kbps, err = chainStartKbps(10_000_000, 10, measured, true)
-	if err != nil || kbps != hardwareSafeBitrate(want) {
-		t.Fatalf("hardware budget = %d, %v; want %d", kbps, err, hardwareSafeBitrate(want))
 	}
 
 	tiny := &overTargetArtifact{
@@ -1717,7 +1939,7 @@ func TestChainStartKbpsUsesMeasuredBreakdown(t *testing.T) {
 		hasBreakdown: true,
 		breakdown:    OutputBreakdown{AudioBytes: 990_000},
 	}
-	if _, err = chainStartKbps(1_000_000, 100, tiny, false); err == nil {
+	if _, err = chainStartKbps(1_000_000, 100, tiny); err == nil {
 		t.Fatal("expected too-small error for sub-minimum video budget")
 	}
 }
