@@ -425,6 +425,27 @@ func (j *Job) run(ffmpeg, ffprobe string) {
 	}
 }
 
+// ladderOptions parameterizes one generation of the correction ladder. The
+// zero value reproduces the classic single-generation behavior; generation 1
+// of the recompression fallback sets chainCandidate, and generation 2 sets
+// the remaining fields.
+type ladderOptions struct {
+	startVideoKbps int
+	chainCandidate bool
+	openingMessage string
+	failureSuffix  string
+}
+
+// overTargetArtifact describes a completed encode that missed the strict
+// target: the recompression fallback feeds it back in as the next
+// generation's input, budgeted from its measured stream breakdown when the
+// probe succeeded.
+type overTargetArtifact struct {
+	actualBytes  int64
+	breakdown    OutputBreakdown
+	hasBreakdown bool
+}
+
 func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	info, err := probeVideo(j.ctx, ffprobe, j.request.Input)
 	if err != nil {
@@ -441,6 +462,28 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	if !ok || encoder.Codec != j.request.VideoCodec {
 		return errors.New("the selected video encoder is not compatible with the selected codec")
 	}
+	outputDir := filepath.Dir(j.request.Output)
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return fmt.Errorf("create output folder: %w", err)
+	}
+	tempDir, err := os.MkdirTemp(outputDir, ".exactsize-work-")
+	if err != nil {
+		return fmt.Errorf("create temporary work folder: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+	tempOutput := filepath.Join(tempDir, "output."+containerExtension(j.request.Container))
+	passLog := filepath.Join(tempDir, "pass")
+
+	_, err = j.runAttemptLadder(ffmpeg, ffprobe, encoder, info, tempOutput, passLog, ladderOptions{})
+	return err
+}
+
+// runAttemptLadder runs one generation of encode attempts with bitrate,
+// frame-rate, and resolution corrections. It returns a nil artifact on
+// success (the output was published), an artifact when opts.chainCandidate
+// is set and the ladder gave up holding a completed over-target output, and
+// an error otherwise.
+func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info VideoInfo, tempOutput, passLog string, opts ladderOptions) (*overTargetArtifact, error) {
 	// ResolutionHeight selects the starting size (zero means source). The
 	// independent AutoResolution toggle controls whether correction may step
 	// down from that starting point after bitrate and FPS are exhausted.
@@ -456,7 +499,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 
 	videoKbps, err := calculateVideoBitrate(j.request, info)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Extreme targets get their frame rate and resolution planned before the
 	// first attempt; walking down to a workable operating point one failed
@@ -466,7 +509,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		// A lower output frame rate shrinks the packet-count mux reserve, so
 		// the planned budget is recomputed before the first attempt.
 		if videoKbps, err = calculateVideoBitrate(j.request, info); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if encoder.Hardware {
@@ -474,18 +517,6 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		// for slightly less makes most encodes fit on the first attempt.
 		videoKbps = hardwareSafeBitrate(videoKbps)
 	}
-
-	outputDir := filepath.Dir(j.request.Output)
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return fmt.Errorf("create output folder: %w", err)
-	}
-	tempDir, err := os.MkdirTemp(outputDir, ".exactsize-work-")
-	if err != nil {
-		return fmt.Errorf("create temporary work folder: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-	tempOutput := filepath.Join(tempDir, "output."+containerExtension(j.request.Container))
-	passLog := filepath.Join(tempDir, "pass")
 
 	j.set(func(status *JobSnapshot) {
 		status.State = "running"
@@ -532,10 +563,10 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 
 	for attempt := 1; attempt <= maximumAttempts; attempt++ {
 		if err := j.ctx.Err(); err != nil {
-			return err
+			return nil, err
 		}
 		if err := removePartialOutput(tempOutput); err != nil {
-			return err
+			return nil, err
 		}
 		removePassLogs(passLog)
 		progressFPS := effectiveOutputFPS(j.request, info)
@@ -558,19 +589,19 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		if useTwoPass {
 			firstPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, true)
 			if err := j.runFFmpeg(ffmpeg, firstPass, info.Duration, progressFPS, 1, 2, attempt, tempOutput, 0, false, false); err != nil {
-				return err
+				return nil, err
 			}
 			secondPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 2, true)
 			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
 				if !errors.As(err, &earlyCorrection) {
-					return err
+					return nil, err
 				}
 			}
 		} else {
 			args := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, false)
 			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
 				if !errors.As(err, &earlyCorrection) {
-					return err
+					return nil, err
 				}
 			}
 		}
@@ -581,7 +612,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			actualBytes = max(earlyCorrection.ProjectedBytes, earlyCorrection.CurrentBytes)
 			earlyContext = earlyCorrectionContext(earlyCorrection, j.request.TargetBytes)
 			if err := removePartialOutput(tempOutput); err != nil {
-				return err
+				return nil, err
 			}
 			j.set(func(status *JobSnapshot) {
 				status.Phase = "Correcting"
@@ -596,7 +627,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			})
 			stat, err := os.Stat(tempOutput)
 			if err != nil {
-				return errors.New("FFmpeg finished without creating an output file")
+				return nil, errors.New("FFmpeg finished without creating an output file")
 			}
 			actualBytes = stat.Size()
 			j.set(func(status *JobSnapshot) { status.EncodedBytes = actualBytes })
@@ -604,7 +635,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 
 		if earlyCorrection == nil && actualBytes <= j.request.TargetBytes {
 			if err := publishOutput(tempOutput, j.request.Output); err != nil {
-				return err
+				return nil, err
 			}
 			finalOutputFPS := effectiveOutputFPS(j.request, info)
 			adaptedFPS := finalOutputFPS < initialOutputFPS-0.001
@@ -637,7 +668,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 				status.RemainingSeconds = 0
 				status.EncodedBytes = actualBytes
 			})
-			return nil
+			return nil, nil
 		}
 
 		actualVideoKbps := measuredVideoKbps(actualBytes, info.Duration, info.AudioTracks, j.request.AudioCodec, j.request.AudioBitrateKbps)
@@ -648,21 +679,21 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			// effective delivered bitrate without waiting for the doomed pass.
 		} else if breakdown, probeErr := probeOutputBreakdown(j.ctx, ffprobe, tempOutput); probeErr != nil {
 			if j.ctx.Err() != nil {
-				return j.ctx.Err()
+				return nil, j.ctx.Err()
 			}
 		} else {
 			actualVideoKbps = streamBitrateKbps(breakdown.VideoBytes, info.Duration)
 			availableVideoKbps = outputVideoBudgetKbps(j.request.TargetBytes, info.Duration, breakdown)
 			if availableVideoKbps < minimumVideoBitrateKbps {
-				return errors.New("the target is too small after measured audio and container overhead")
+				return nil, errors.New("the target is too small after measured audio and container overhead")
 			}
 		}
 
 		if attempt == maximumAttempts {
 			if encoder.Hardware {
-				return fmt.Errorf("could not bring the output below the strict target after %d attempts; a software encoder, a lower resolution, or a different video codec may reach targets the GPU cannot", maximumAttempts)
+				return nil, fmt.Errorf("could not bring the output below the strict target after %d attempts; a software encoder, a lower resolution, or a different video codec may reach targets the GPU cannot", maximumAttempts)
 			}
-			return fmt.Errorf("could not bring the output below the strict target after %d attempts", maximumAttempts)
+			return nil, fmt.Errorf("could not bring the output below the strict target after %d attempts", maximumAttempts)
 		}
 
 		if encoder.Hardware {
@@ -703,7 +734,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 				if !bitrateExhausted {
 					minimumKbps, ok := minimumBitrateRetry(videoKbps)
 					if !ok {
-						return errors.New("could not exhaust the hardware encoder's bitrate options")
+						return nil, errors.New("could not exhaust the hardware encoder's bitrate options")
 					}
 					previousKbps := videoKbps
 					videoKbps = minimumKbps
@@ -731,14 +762,14 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 					continue
 				}
 				if !autoResolution {
-					return errors.New("the GPU encoder cannot reach this target at the selected resolution and frame-rate range; lower the minimum FPS or resolution, switch to a software encoder, or raise the target")
+					return nil, errors.New("the GPU encoder cannot reach this target at the selected resolution and frame-rate range; lower the minimum FPS or resolution, switch to a software encoder, or raise the target")
 				}
 				fpsOptionsExhausted := adaptiveFPSStage > 0
 				adaptiveFPSStage = 3
 				previousWidth, previousHeight := effectiveResolution(j.request, info)
 				width, height, ok := floorAwareDownscale(info.Width, info.Height, j.request.ScaleHeight, actualVideoKbps, correctionBudgetKbps)
 				if !ok {
-					return errors.New("the GPU encoder cannot reach this target even at reduced resolution; switch to a software encoder, try a different video codec, or raise the target")
+					return nil, errors.New("the GPU encoder cannot reach this target even at reduced resolution; switch to a software encoder, try a different video codec, or raise the target")
 				}
 				j.request.ScaleWidth, j.request.ScaleHeight = width, height
 				videoKbps = correctionBudgetKbps
@@ -786,7 +817,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			previousKbps := videoKbps
 			videoKbps = proportionalVideoCorrection(videoKbps, actualVideoKbps, correctionBudgetKbps)
 			if videoKbps < minimumVideoBitrateKbps {
-				return errors.New("the target is too small for this duration and measured non-video overhead")
+				return nil, errors.New("the target is too small for this duration and measured non-video overhead")
 			}
 			attemptMessage = earlyContext + bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
 			continue
@@ -797,12 +828,12 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		previousKbps := videoKbps
 		videoKbps = int(math.Floor(float64(videoKbps) * ratio * 0.992))
 		if videoKbps < minimumVideoBitrateKbps {
-			return errors.New("the target is too small for this duration and audio bitrate")
+			return nil, errors.New("the target is too small for this duration and audio bitrate")
 		}
 		attemptMessage = earlyContext + bitrateCorrectionMessage(previousKbps, videoKbps, effectiveOutputFPS(j.request, info))
 	}
 
-	return errors.New("compression ended unexpectedly")
+	return nil, errors.New("compression ended unexpectedly")
 }
 
 func removePartialOutput(path string) error {
