@@ -1522,6 +1522,54 @@ func TestAudioCopyEmitsCopyArgs(t *testing.T) {
 	}
 }
 
+func TestChainOrFailRoutesArtifactsAndSuffixes(t *testing.T) {
+	artifact := &overTargetArtifact{actualBytes: 12}
+	got, err := chainOrFail(ladderOptions{chainCandidate: true}, artifact, errors.New("boom"))
+	if err != nil || got != artifact {
+		t.Fatalf("chain candidate with artifact = %v, %v; want artifact, nil", got, err)
+	}
+	got, err = chainOrFail(ladderOptions{chainCandidate: true}, nil, errors.New("boom"))
+	if got != nil || err == nil || err.Error() != "boom" {
+		t.Fatalf("chain candidate without artifact = %v, %v; want nil, boom", got, err)
+	}
+	got, err = chainOrFail(ladderOptions{failureSuffix: ", even after recompressing the output"}, nil, errors.New("boom"))
+	if got != nil || err == nil || err.Error() != "boom, even after recompressing the output" {
+		t.Fatalf("suffixed failure = %v, %v", got, err)
+	}
+}
+
+func TestChainStartKbpsUsesMeasuredBreakdown(t *testing.T) {
+	noBreakdown := &overTargetArtifact{actualBytes: 12_000_000}
+	kbps, err := chainStartKbps(10_000_000, 10, noBreakdown, false)
+	if err != nil || kbps != 0 {
+		t.Fatalf("no breakdown = %d, %v; want 0, nil", kbps, err)
+	}
+
+	measured := &overTargetArtifact{
+		actualBytes:  12_000_000,
+		hasBreakdown: true,
+		breakdown:    OutputBreakdown{AudioBytes: 1_000_000, MuxBytes: 200_000},
+	}
+	want := outputVideoBudgetKbps(10_000_000, 10, measured.breakdown)
+	kbps, err = chainStartKbps(10_000_000, 10, measured, false)
+	if err != nil || kbps != want {
+		t.Fatalf("software budget = %d, %v; want %d", kbps, err, want)
+	}
+	kbps, err = chainStartKbps(10_000_000, 10, measured, true)
+	if err != nil || kbps != hardwareSafeBitrate(want) {
+		t.Fatalf("hardware budget = %d, %v; want %d", kbps, err, hardwareSafeBitrate(want))
+	}
+
+	tiny := &overTargetArtifact{
+		actualBytes:  1_100_000,
+		hasBreakdown: true,
+		breakdown:    OutputBreakdown{AudioBytes: 990_000},
+	}
+	if _, err = chainStartKbps(1_000_000, 100, tiny, false); err == nil {
+		t.Fatal("expected too-small error for sub-minimum video budget")
+	}
+}
+
 func validTestRequest() EncodeRequest {
 	return EncodeRequest{
 		Input: "/tmp/input.mp4", Output: "/tmp/output.mp4", TargetBytes: 10_000_000,

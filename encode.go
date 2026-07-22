@@ -498,14 +498,19 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 	initialOutputFPS := effectiveOutputFPS(j.request, info)
 
 	videoKbps, err := calculateVideoBitrate(j.request, info)
-	if err != nil {
+	if opts.startVideoKbps > 0 {
+		// The recompression generation budgets from the intermediate's
+		// measured breakdown; the nominal estimate only matters when that
+		// probe failed.
+		videoKbps = opts.startVideoKbps
+	} else if err != nil {
 		return nil, err
 	}
 	// Extreme targets get their frame rate and resolution planned before the
 	// first attempt; walking down to a workable operating point one failed
 	// encode at a time costs minutes per rung on long files.
 	plannedFPS, plannedResolution := planStartingOperatingPoint(&j.request, info, videoKbps)
-	if plannedFPS {
+	if plannedFPS && opts.startVideoKbps == 0 {
 		// A lower output frame rate shrinks the packet-count mux reserve, so
 		// the planned budget is recomputed before the first attempt.
 		if videoKbps, err = calculateVideoBitrate(j.request, info); err != nil {
@@ -544,7 +549,7 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 		// bounded; adaptive FPS/resolution fallback is hardware-only.
 		maximumAttempts = min(maximumAttempts, 3)
 	}
-	attemptMessage := ""
+	attemptMessage := opts.openingMessage
 	if plannedFPS || plannedResolution {
 		details := make([]string, 0, 2)
 		if plannedResolution {
@@ -553,12 +558,12 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 		if plannedFPS {
 			details = append(details, formatFrameRate(effectiveOutputFPS(j.request, info))+" fps")
 		}
-		attemptMessage = fmt.Sprintf(
+		attemptMessage = strings.TrimSpace(opts.openingMessage + " " + fmt.Sprintf(
 			"Starting at %s so %d kbps of video can meet the %.1f MB target.",
 			strings.Join(details, " and "),
 			videoKbps,
 			float64(j.request.TargetBytes)/1_000_000,
-		)
+		))
 	}
 
 	for attempt := 1; attempt <= maximumAttempts; attempt++ {
@@ -571,6 +576,14 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 		removePassLogs(passLog)
 		progressFPS := effectiveOutputFPS(j.request, info)
 		timeBoundedProjection := encoder.Hardware && needsTimeBoundedHardwareProjection(j.request, info, videoKbps)
+		// The recompression fallback needs a complete file to feed back in,
+		// so generation 1's final attempt runs without the size monitor: the
+		// output either fits or becomes the chain input.
+		monitorTargetBytes := j.request.TargetBytes
+		if opts.chainCandidate && attempt == maximumAttempts {
+			monitorTargetBytes = 0
+			timeBoundedProjection = false
+		}
 		j.attemptStarted = time.Now()
 
 		j.set(func(status *JobSnapshot) {
@@ -592,14 +605,14 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 				return nil, err
 			}
 			secondPass := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 2, true)
-			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
+			if err := j.runFFmpeg(ffmpeg, secondPass, info.Duration, progressFPS, 2, 2, attempt, tempOutput, monitorTargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
 				if !errors.As(err, &earlyCorrection) {
 					return nil, err
 				}
 			}
 		} else {
 			args := buildFFmpegArgs(j.request, info, videoKbps, tempOutput, passLog, 1, false)
-			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput, j.request.TargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
+			if err := j.runFFmpeg(ffmpeg, args, info.Duration, progressFPS, 1, 1, attempt, tempOutput, monitorTargetBytes, timeBoundedProjection, encoder.Hardware); err != nil {
 				if !errors.As(err, &earlyCorrection) {
 					return nil, err
 				}
@@ -673,6 +686,8 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 
 		actualVideoKbps := measuredVideoKbps(actualBytes, info.Duration, info.AudioTracks, j.request.AudioCodec, j.request.AudioBitrateKbps)
 		availableVideoKbps := 0
+		measuredBreakdown := OutputBreakdown{}
+		haveBreakdown := false
 		if earlyCorrection != nil {
 			// A deliberately killed output has no finalized index/trailer to
 			// probe. Its stable size trajectory still gives correction logic an
@@ -682,6 +697,8 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 				return nil, j.ctx.Err()
 			}
 		} else {
+			measuredBreakdown = breakdown
+			haveBreakdown = true
 			actualVideoKbps = streamBitrateKbps(breakdown.VideoBytes, info.Duration)
 			availableVideoKbps = outputVideoBudgetKbps(j.request.TargetBytes, info.Duration, breakdown)
 			if availableVideoKbps < minimumVideoBitrateKbps {
@@ -689,11 +706,22 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 			}
 		}
 
+		// Only a completed attempt leaves a full file behind; an
+		// early-corrected attempt was deliberately killed and deleted.
+		var completedArtifact *overTargetArtifact
+		if earlyCorrection == nil {
+			completedArtifact = &overTargetArtifact{
+				actualBytes:  actualBytes,
+				breakdown:    measuredBreakdown,
+				hasBreakdown: haveBreakdown,
+			}
+		}
+
 		if attempt == maximumAttempts {
 			if encoder.Hardware {
-				return nil, fmt.Errorf("could not bring the output below the strict target after %d attempts; a software encoder, a lower resolution, or a different video codec may reach targets the GPU cannot", maximumAttempts)
+				return chainOrFail(opts, completedArtifact, fmt.Errorf("could not bring the output below the strict target after %d attempts; a software encoder, a lower resolution, or a different video codec may reach targets the GPU cannot", maximumAttempts))
 			}
-			return nil, fmt.Errorf("could not bring the output below the strict target after %d attempts", maximumAttempts)
+			return chainOrFail(opts, completedArtifact, fmt.Errorf("could not bring the output below the strict target after %d attempts", maximumAttempts))
 		}
 
 		if encoder.Hardware {
@@ -762,14 +790,14 @@ func (j *Job) runAttemptLadder(ffmpeg, ffprobe string, encoder EncoderInfo, info
 					continue
 				}
 				if !autoResolution {
-					return nil, errors.New("the GPU encoder cannot reach this target at the selected resolution and frame-rate range; lower the minimum FPS or resolution, switch to a software encoder, or raise the target")
+					return chainOrFail(opts, completedArtifact, errors.New("the GPU encoder cannot reach this target at the selected resolution and frame-rate range; lower the minimum FPS or resolution, switch to a software encoder, or raise the target"))
 				}
 				fpsOptionsExhausted := adaptiveFPSStage > 0
 				adaptiveFPSStage = 3
 				previousWidth, previousHeight := effectiveResolution(j.request, info)
 				width, height, ok := floorAwareDownscale(info.Width, info.Height, j.request.ScaleHeight, actualVideoKbps, correctionBudgetKbps)
 				if !ok {
-					return nil, errors.New("the GPU encoder cannot reach this target even at reduced resolution; switch to a software encoder, try a different video codec, or raise the target")
+					return chainOrFail(opts, completedArtifact, errors.New("the GPU encoder cannot reach this target even at reduced resolution; switch to a software encoder, try a different video codec, or raise the target"))
 				}
 				j.request.ScaleWidth, j.request.ScaleHeight = width, height
 				videoKbps = correctionBudgetKbps
@@ -1577,6 +1605,38 @@ func outputVideoBudgetKbps(targetBytes int64, duration float64, breakdown Output
 		return 0
 	}
 	return streamBitrateKbps(targetBytes-nonVideoBytes, duration)
+}
+
+// chainOrFail is the single decision point every ladder give-up site funnels
+// through: generation 1 hands a completed over-target output to the
+// recompression fallback instead of failing, and generation 2 fails with the
+// ladder's error suffixed so the user knows the last resort already ran.
+func chainOrFail(opts ladderOptions, artifact *overTargetArtifact, failure error) (*overTargetArtifact, error) {
+	if opts.chainCandidate && artifact != nil {
+		return artifact, nil
+	}
+	if opts.failureSuffix != "" {
+		return nil, errors.New(failure.Error() + opts.failureSuffix)
+	}
+	return nil, failure
+}
+
+// chainStartKbps seeds the recompression generation's bitrate from the
+// intermediate's measured stream breakdown; a zero result tells the ladder to
+// fall back to its own calculateVideoBitrate estimate because the breakdown
+// probe failed.
+func chainStartKbps(targetBytes int64, duration float64, artifact *overTargetArtifact, hardware bool) (int, error) {
+	if !artifact.hasBreakdown {
+		return 0, nil
+	}
+	kbps := outputVideoBudgetKbps(targetBytes, duration, artifact.breakdown)
+	if hardware {
+		kbps = hardwareSafeBitrate(kbps)
+	}
+	if kbps < minimumVideoBitrateKbps {
+		return 0, errors.New("the target is too small after measured audio and container overhead")
+	}
+	return kbps, nil
 }
 
 func hardwareSafeBitrate(videoKbps int) int {
