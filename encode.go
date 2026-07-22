@@ -88,6 +88,7 @@ type EncodeRequest struct {
 	Remux            bool    `json:"remux"`
 	MuxAudio         bool    `json:"muxAudio"`
 	VAAPIDevice      string  `json:"-"`
+	AudioCopy        bool    `json:"-"`
 	ScaleWidth       int     `json:"-"`
 	ScaleHeight      int     `json:"-"`
 	EncoderMaxLong   int     `json:"-"`
@@ -1708,6 +1709,12 @@ func floorAwareDownscale(sourceWidth, sourceHeight, currentHeight, actualKbps, b
 func audioEncoderArgs(request EncodeRequest, info VideoInfo) []string {
 	if request.AudioCodec == "none" {
 		return []string{"-an"}
+	}
+	// The recompression generation's audio already went through the requested
+	// codec and bitrate once; copying it avoids a second lossy pass and keeps
+	// the audio byte count identical to the measured intermediate.
+	if request.AudioCopy {
+		return []string{"-c:a", "copy"}
 	}
 	encoder := map[string]string{
 		"aac": "aac", "opus": "libopus", "vorbis": "libvorbis", "mp3": "libmp3lame",

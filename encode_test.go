@@ -1498,6 +1498,30 @@ func testTool(t *testing.T, environment, fallback string) string {
 	return path
 }
 
+func TestAudioCopyEmitsCopyArgs(t *testing.T) {
+	request := validTestRequest()
+	request.AudioCopy = true
+	args := audioEncoderArgs(request, VideoInfo{})
+	if len(args) != 2 || args[0] != "-c:a" || args[1] != "copy" {
+		t.Fatalf("audio copy args = %v; want [-c:a copy]", args)
+	}
+
+	request.AudioCodec = "none"
+	args = audioEncoderArgs(request, VideoInfo{})
+	if len(args) != 1 || args[0] != "-an" {
+		t.Fatalf("audio none with copy flag = %v; want [-an]", args)
+	}
+
+	request = validTestRequest()
+	request.AudioCopy = true
+	request.TwoPass = false
+	full := buildFFmpegArgs(request, VideoInfo{}, 1000, "/tmp/out.mp4", "/tmp/pass", 1, false)
+	joined := strings.Join(full, " ")
+	if !strings.Contains(joined, "-c:a copy") || strings.Contains(joined, "-b:a") {
+		t.Fatalf("full args = %v; want -c:a copy and no -b:a", full)
+	}
+}
+
 func validTestRequest() EncodeRequest {
 	return EncodeRequest{
 		Input: "/tmp/input.mp4", Output: "/tmp/output.mp4", TargetBytes: 10_000_000,
