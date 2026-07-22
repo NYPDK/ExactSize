@@ -1185,7 +1185,7 @@ function updateEstimate() {
   const tracks = elements.audioCodec.value === "none" ? 0 : state.input.audioTracks;
   const audioKbps = tracks * Number(elements.audioBitrate.value || 0);
   const videoKbps = Math.floor((((target - reserve) * 8) / state.input.duration / 1000) - audioKbps);
-  if (videoKbps < 64) {
+  if (videoKbps < 16) {
     elements.bitrateEstimate.textContent = "Target is too small for this duration";
     return;
   }

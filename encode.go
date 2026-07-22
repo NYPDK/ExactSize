@@ -18,7 +18,12 @@ import (
 )
 
 const (
-	minimumVideoBitrateKbps = 64
+	// Software rate control still honors requests this small (verified down to
+	// 16 kbps on x264 two-pass and AMD VAAPI alike), and the starting-point
+	// planner pairs such budgets with a frame size they can feed. This floor
+	// exists to reject targets where even the smallest plannable frame cannot
+	// carry a picture, not to protect quality.
+	minimumVideoBitrateKbps = 16
 	// Each distinct FPS or resolution setting gets this many opportunities
 	// to converge on the target bitrate before the next fallback is tried.
 	maximumEncodeAttempts = 8
@@ -31,7 +36,28 @@ var minimumAudioBitrateKbps = map[string]int{
 
 // downscaleLadder holds the output heights tried, top to bottom, when a
 // hardware encoder cannot produce few enough bits at the current resolution.
+// It stops at 360 because codec services reject smaller frames outright (AMD's
+// AV1 encoder needs 256 lines), and a failed encoder open kills the whole job.
 var downscaleLadder = []int{720, 540, 360}
+
+// softwareDownscaleLadder extends the fallback heights for software encoders,
+// which accept arbitrarily small frames. The extra rungs are what make
+// feature-length files at tens-of-megabytes targets representable at all.
+var softwareDownscaleLadder = []int{720, 540, 360, 240, 180}
+
+// minimumStartingBitsPerPixelFrame is the per-codec bit density below which a
+// starting resolution and frame rate cannot look acceptable: rate control
+// spends the entire budget signalling block structure, so a smaller frame at
+// the same bitrate is strictly better. The starting-point planner steps
+// settings down until the initial request clears its codec's floor.
+var minimumStartingBitsPerPixelFrame = map[string]float64{
+	"h264": 0.010,
+	"h265": 0.008,
+	"vp9":  0.008,
+	"av1":  0.006,
+	"h266": 0.006,
+	"av2":  0.006,
+}
 
 type EncoderInfo struct {
 	ID           string `json:"id"`
@@ -431,6 +457,17 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	if err != nil {
 		return err
 	}
+	// Extreme targets get their frame rate and resolution planned before the
+	// first attempt; walking down to a workable operating point one failed
+	// encode at a time costs minutes per rung on long files.
+	plannedFPS, plannedResolution := planStartingOperatingPoint(&j.request, info, videoKbps)
+	if plannedFPS {
+		// A lower output frame rate shrinks the packet-count mux reserve, so
+		// the planned budget is recomputed before the first attempt.
+		if videoKbps, err = calculateVideoBitrate(j.request, info); err != nil {
+			return err
+		}
+	}
 	if encoder.Hardware {
 		// Hardware rate control tends to land a few percent above the request; asking
 		// for slightly less makes most encodes fit on the first attempt.
@@ -453,7 +490,7 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		status.State = "running"
 		status.Passes = passes
 		status.VideoBitrateKbps = videoKbps
-		status.OutputFPS = initialOutputFPS
+		status.OutputFPS = effectiveOutputFPS(j.request, info)
 	})
 
 	originalKbps := videoKbps
@@ -463,6 +500,11 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	previousScaleHeight := -1
 	previousOutputFPS := -1.0
 	adaptiveFPSStage := 0
+	if plannedFPS {
+		// The planner already consumed the range's midpoint tier; a later
+		// adaptive step goes straight to the selected minimum.
+		adaptiveFPSStage = 1
+	}
 	maximumAttempts := correctionAttemptLimit(j.request, info, autoResolution)
 	if !encoder.Hardware {
 		// Software rate control is deterministic enough that a completed output
@@ -471,6 +513,21 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 		maximumAttempts = min(maximumAttempts, 3)
 	}
 	attemptMessage := ""
+	if plannedFPS || plannedResolution {
+		details := make([]string, 0, 2)
+		if plannedResolution {
+			details = append(details, fmt.Sprintf("%d×%d", j.request.ScaleWidth, j.request.ScaleHeight))
+		}
+		if plannedFPS {
+			details = append(details, formatFrameRate(effectiveOutputFPS(j.request, info))+" fps")
+		}
+		attemptMessage = fmt.Sprintf(
+			"Starting at %s so %d kbps of video can meet the %.1f MB target.",
+			strings.Join(details, " and "),
+			videoKbps,
+			float64(j.request.TargetBytes)/1_000_000,
+		)
+	}
 
 	for attempt := 1; attempt <= maximumAttempts; attempt++ {
 		if err := j.ctx.Err(); err != nil {
@@ -619,10 +676,11 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 			if availableVideoKbps > 0 {
 				correctionBudgetKbps = hardwareSafeBitrate(availableVideoKbps)
 			}
-			confirmedFloor := previousScaleWidth == j.request.ScaleWidth &&
-				previousScaleHeight == j.request.ScaleHeight &&
-				math.Abs(previousOutputFPS-effectiveOutputFPS(j.request, info)) < 0.001 &&
-				correctionHitBitrateFloor(previousRequestedKbps, previousActualKbps, videoKbps, actualVideoKbps, correctionBudgetKbps)
+			confirmedFloor := deliveredFloorEvidence(videoKbps, actualVideoKbps) ||
+				(previousScaleWidth == j.request.ScaleWidth &&
+					previousScaleHeight == j.request.ScaleHeight &&
+					math.Abs(previousOutputFPS-effectiveOutputFPS(j.request, info)) < 0.001 &&
+					correctionHitBitrateFloor(previousRequestedKbps, previousActualKbps, videoKbps, actualVideoKbps, correctionBudgetKbps))
 			previousRequestedKbps = videoKbps
 			previousActualKbps = actualVideoKbps
 			previousScaleWidth = j.request.ScaleWidth
@@ -1330,6 +1388,71 @@ func effectiveResolution(request EncodeRequest, info VideoInfo) (width, height i
 	return info.Width, info.Height
 }
 
+// planStartingOperatingPoint chooses the first attempt's frame rate and
+// resolution for extreme targets instead of discovering them one failed
+// attempt at a time. It walks the same quality-first ladder correction uses —
+// frame rate within the selected adaptive range, then the automatic
+// resolution rungs — and stops at the first setting whose bits-per-pixel-frame
+// density is workable for the codec, so ordinary targets are left untouched.
+// Fixed-rate and fixed-resolution selections are honored unchanged. When even
+// the smallest permitted rung stays below the density floor it is still taken:
+// it is the best remaining shape, and bitrate correction proceeds from there.
+func planStartingOperatingPoint(request *EncodeRequest, info VideoInfo, videoKbps int) (fpsLowered, resolutionLowered bool) {
+	threshold := minimumStartingBitsPerPixelFrame[request.VideoCodec]
+	width, height := effectiveResolution(*request, info)
+	fps := effectiveOutputFPS(*request, info)
+	if threshold <= 0 || videoKbps <= 0 || width <= 0 || height <= 0 || fps <= 0 {
+		return false, false
+	}
+	density := func(width, height int, fps float64) float64 {
+		return float64(videoKbps) * 1000 / (float64(width) * float64(height) * fps)
+	}
+	if density(width, height, fps) >= threshold {
+		return false, false
+	}
+	if minimum := adaptiveMinimumOutputFPS(*request, info); minimum > 0 {
+		midpoint := math.Round((fps + minimum) / 2)
+		for _, candidate := range []float64{midpoint, minimum} {
+			if candidate <= minimum-0.001 || candidate >= fps-0.001 {
+				continue
+			}
+			request.OutputFPS = candidate
+			fpsLowered = true
+			fps = candidate
+			if density(width, height, fps) >= threshold {
+				return fpsLowered, false
+			}
+		}
+	}
+	if !request.AutoResolution {
+		return fpsLowered, false
+	}
+	ladder := downscaleLadder
+	if encoder, ok := supportedEncoder(request.Encoder); ok && !encoder.Hardware {
+		ladder = softwareDownscaleLadder
+	}
+	smallestWidth, smallestHeight := 0, 0
+	for _, rung := range ladder {
+		if rung >= height {
+			continue
+		}
+		rungWidth, rungHeight := scaleDimensions(info.Width, info.Height, rung)
+		if rungWidth <= 0 || rungHeight <= 0 {
+			continue
+		}
+		smallestWidth, smallestHeight = rungWidth, rungHeight
+		if density(rungWidth, rungHeight, fps) >= threshold {
+			request.ScaleWidth, request.ScaleHeight = rungWidth, rungHeight
+			return fpsLowered, true
+		}
+	}
+	if smallestWidth > 0 && smallestHeight > 0 {
+		request.ScaleWidth, request.ScaleHeight = smallestWidth, smallestHeight
+		return fpsLowered, true
+	}
+	return fpsLowered, false
+}
+
 // needsTimeBoundedHardwareProjection identifies settings where the requested
 // rate is close enough to a GPU encoder floor that waiting for 25% would add
 // little confidence. Ordinary higher-bitrate hardware jobs keep the more
@@ -1439,6 +1562,15 @@ func proportionalVideoCorrection(requestedKbps, actualKbps, budgetKbps int) int 
 	return int(math.Floor(float64(requestedKbps) * float64(budgetKbps) / float64(actualKbps) * 0.992))
 }
 
+// deliveredFloorEvidence reports whether one attempt already proves a hardware
+// rate floor: delivering at least double the requested bitrate means lower
+// requests cannot close the gap, so the per-tier minimum-bitrate probe would
+// only spend another bounded attempt confirming what this one showed. Mild
+// overshoots below 2× keep today's careful probe-then-confirm behavior.
+func deliveredFloorEvidence(requestedKbps, actualKbps int) bool {
+	return requestedKbps > 0 && actualKbps >= requestedKbps*2
+}
+
 // correctionHitBitrateFloor compares two completed attempts at the same
 // resolution. A hardware encoder is at a confirmed floor when a meaningful
 // request reduction yields less than half as much delivered-bitrate reduction
@@ -1541,19 +1673,32 @@ func floorAwareDownscale(sourceWidth, sourceHeight, currentHeight, actualKbps, b
 	if effective <= 0 || actualKbps <= 0 {
 		return 0, 0, false
 	}
-	for _, height := range downscaleLadder {
-		if height >= effective {
-			continue
-		}
+	predictedFloor := func(height int) float64 {
 		// Floors do not scale purely with pixel count: measured VAAPI floors
 		// (734/373/242/166 kbps at 1080p/720p/540p/360p) fit a fixed
 		// per-frame share of ~15% plus a pixel-proportional share.
 		pixelRatio := float64(height*height) / float64(effective*effective)
-		predicted := float64(actualKbps) * (0.15 + 0.85*pixelRatio)
-		if predicted > float64(budgetKbps)*0.9 {
+		return float64(actualKbps) * (0.15 + 0.85*pixelRatio)
+	}
+	smallest := 0
+	for _, height := range downscaleLadder {
+		if height >= effective {
+			continue
+		}
+		smallest = height
+		if predictedFloor(height) > float64(budgetKbps)*0.9 {
 			continue
 		}
 		if width, scaled := scaleDimensions(sourceWidth, sourceHeight, height); width > 0 {
+			return width, scaled, true
+		}
+	}
+	// No rung passes the strict fit, but the model is content-blind and
+	// regularly overestimates floors on easy material. One bounded attempt at
+	// the smallest rung is cheaper than failing a feasible extreme encode, so
+	// the benefit of the doubt extends to predictions within 2.5× of budget.
+	if smallest > 0 && predictedFloor(smallest) <= float64(budgetKbps)*2.5 {
+		if width, scaled := scaleDimensions(sourceWidth, sourceHeight, smallest); width > 0 {
 			return width, scaled, true
 		}
 	}
@@ -1964,7 +2109,24 @@ func runHardwareProbeAtSize(ffmpeg, encoderID, vaapiDevice string, width, height
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	args := []string{"-hide_banner", "-v", "error", "-nostdin"}
+	// The probe keeps its three frames and decodes them back, because an
+	// encoder that runs is not necessarily usable: vendor codecs can accept
+	// frames yet emit packets no ordinary decoder parses (the Pixel 7's VP9
+	// MediaCodec encoder does exactly this), which would surface as broken
+	// output files instead of a missing encoder entry.
+	probeFile, err := os.CreateTemp("", "exactsize-probe-*.bin")
+	if err != nil {
+		return false
+	}
+	probePath := probeFile.Name()
+	_ = probeFile.Close()
+	defer os.Remove(probePath)
+	encoder, _ := supportedEncoder(encoderID)
+	streamFormat := probeStreamFormats[encoder.Codec]
+	if streamFormat == "" {
+		streamFormat = "matroska"
+	}
+	args := []string{"-hide_banner", "-v", "error", "-nostdin", "-y"}
 	if vaapiDevice != "" {
 		args = append(args, "-vaapi_device", vaapiDevice)
 	}
@@ -1987,10 +2149,31 @@ func runHardwareProbeAtSize(ffmpeg, encoderID, vaapiDevice string, width, height
 		// older desktop FFmpeg builds simply never advertise these IDs.
 		args = append(args, "-ndk_async", "1")
 	}
-	args = append(args, "-b:v", "2M", "-frames:v", "3", "-f", "null", "-")
-	command := exec.CommandContext(ctx, ffmpeg, args...)
-	configureBackgroundCommand(command)
-	return command.Run() == nil
+	args = append(args, "-b:v", "2M", "-frames:v", "3", "-f", streamFormat, probePath)
+	encode := exec.CommandContext(ctx, ffmpeg, args...)
+	configureBackgroundCommand(encode)
+	if encode.Run() != nil {
+		return false
+	}
+	verify := exec.CommandContext(ctx, ffmpeg,
+		"-hide_banner", "-v", "error", "-nostdin",
+		"-xerror", "-err_detect", "explode",
+		"-f", streamFormat, "-i", probePath, "-f", "null", "-",
+	)
+	configureBackgroundCommand(verify)
+	return verify.Run() == nil
+}
+
+// probeStreamFormats maps each hardware codec onto a raw bitstream container
+// for the probe round-trip. Global-header containers such as Matroska or MP4
+// cannot hold probe output: asynchronous MediaCodec encoders deliver their
+// parameter sets alongside the first packet, after those muxers have already
+// demanded them. The raw formats carry every parameter in-band instead.
+var probeStreamFormats = map[string]string{
+	"h264": "h264",
+	"h265": "hevc",
+	"vp9":  "ivf",
+	"av1":  "ivf",
 }
 
 func inspectFFmpeg(ffmpeg string) (AppStatus, map[string]string, error) {

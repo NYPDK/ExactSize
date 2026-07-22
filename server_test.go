@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -9,6 +10,17 @@ import (
 	"testing"
 	"time"
 )
+
+func TestEstimateGateMatchesBackendMinimumBitrate(t *testing.T) {
+	javascript, err := webAssets.ReadFile("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := fmt.Sprintf("videoKbps < %d", minimumVideoBitrateKbps)
+	if !strings.Contains(string(javascript), gate) {
+		t.Fatalf("the client estimate must reject targets below the backend floor with %q", gate)
+	}
+}
 
 func TestFrameRateRangeUsesTwoWholeNumberHandles(t *testing.T) {
 	html, err := webAssets.ReadFile("web/index.html")

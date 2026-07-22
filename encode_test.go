@@ -555,7 +555,7 @@ func TestBitrateOptionsGateFPSAndResolutionFallback(t *testing.T) {
 
 func TestBitrateCorrectionMessageNamesEveryChangedValue(t *testing.T) {
 	message := bitrateCorrectionMessage(409, minimumVideoBitrateKbps, 45)
-	for _, detail := range []string{"from 409 to 64 kbps", "at 45 fps", "before trying a lower frame rate or resolution"} {
+	for _, detail := range []string{"from 409 to " + strconv.Itoa(minimumVideoBitrateKbps) + " kbps", "at 45 fps", "before trying a lower frame rate or resolution"} {
 		if !strings.Contains(message, detail) {
 			t.Fatalf("correction message %q is missing %q", message, detail)
 		}
@@ -835,10 +835,30 @@ func TestHardwareCorrection(t *testing.T) {
 	if retry, hopeless := hardwareCorrection(3128, 3003, 2950); retry != 0 || hopeless {
 		t.Error("an honored request must fall back to proportional correction")
 	}
-	// A calculated correction just above the 64 kbps floor should snap to the
+	// With the 16 kbps floor, a 67 kbps correction is a real operating point
+	// rather than a negligible step above the minimum, so it is kept.
+	if retry, hopeless := hardwareCorrection(79, 79, 90); retry != 67 || hopeless {
+		t.Fatalf("hardwareCorrection(79, 79, 90) = %d, %v; want 67, false", retry, hopeless)
+	}
+	// A calculated correction within a hair of the floor still snaps to the
 	// floor instead of spending another long attempt on a negligible step.
-	if retry, hopeless := hardwareCorrection(79, 79, 90); retry != minimumVideoBitrateKbps || hopeless {
-		t.Fatalf("near-minimum hardware correction = %d, %v; want 64, false", retry, hopeless)
+	if retry, hopeless := hardwareCorrection(28, 28, 36); retry != minimumVideoBitrateKbps || hopeless {
+		t.Fatalf("hardwareCorrection(28, 28, 36) = %d, %v; want %d, false", retry, hopeless, minimumVideoBitrateKbps)
+	}
+}
+
+func TestDeliveredFloorEvidence(t *testing.T) {
+	if !deliveredFloorEvidence(91, 734) {
+		t.Fatal("delivering 8x the requested bitrate is conclusive floor evidence")
+	}
+	if !deliveredFloorEvidence(400, 800) {
+		t.Fatal("delivering exactly double the request is floor evidence")
+	}
+	if deliveredFloorEvidence(400, 799) {
+		t.Fatal("less than double the request must keep the probe-then-confirm path")
+	}
+	if deliveredFloorEvidence(0, 500) {
+		t.Fatal("a missing request measurement cannot prove a floor")
 	}
 }
 
@@ -861,6 +881,105 @@ func TestFloorAwareDownscale(t *testing.T) {
 	// Already downscaled: only lower rungs are considered.
 	if _, h, _ := floorAwareDownscale(1920, 1080, 540, 242, 150); h != 360 {
 		t.Errorf("from 540p the next viable rung is 360p, got %dp", h)
+	}
+	// The floor model is content-blind and often pessimistic on easy material,
+	// so when no rung passes the strict fit, the smallest rung still gets one
+	// benefit-of-the-doubt attempt while its prediction is within 2.5x budget.
+	if w, h, ok := floorAwareDownscale(1920, 1080, 0, 740, 100); !ok || h != 360 || w != 640 {
+		t.Errorf("floorAwareDownscale(740 vs 100) = %d, %d, %v; want the 640x360 last-resort attempt", w, h, ok)
+	}
+}
+
+func TestPlanStartingOperatingPoint(t *testing.T) {
+	source := VideoInfo{Width: 1920, Height: 1080, FPS: 23.98}
+	tests := []struct {
+		name                  string
+		request               EncodeRequest
+		videoKbps             int
+		wantFPSLowered        bool
+		wantResolutionLowered bool
+		wantOutputFPS         float64
+		wantWidth, wantHeight int
+	}{
+		{
+			"healthy budgets keep the selected settings",
+			EncodeRequest{VideoCodec: "av1", Encoder: "av1_vaapi", AutoResolution: true, MinimumOutputFPS: 15},
+			2500, false, false, 0, 0, 0,
+		},
+		{
+			"a feature film squeezed to ~90 kbps starts at 720p and the minimum frame rate",
+			EncodeRequest{VideoCodec: "av1", Encoder: "av1_vaapi", AutoResolution: true, MinimumOutputFPS: 15},
+			94, true, true, 15, 1280, 720,
+		},
+		{
+			"software ladders below 360p make a 16 kbps movie representable",
+			EncodeRequest{VideoCodec: "h264", Encoder: "libx264", AutoResolution: true},
+			16, false, true, 0, 320, 180,
+		},
+		{
+			"the adaptive midpoint is enough for a moderate squeeze",
+			EncodeRequest{VideoCodec: "av1", Encoder: "libaom-av1", MinimumOutputFPS: 12},
+			224, true, false, 18, 0, 0,
+		},
+		{
+			"fixed frame rate and resolution are honored no matter the density",
+			EncodeRequest{VideoCodec: "h264", Encoder: "libx264"},
+			16, false, false, 0, 0, 0,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := test.request
+			fpsLowered, resolutionLowered := planStartingOperatingPoint(&request, source, test.videoKbps)
+			if fpsLowered != test.wantFPSLowered || resolutionLowered != test.wantResolutionLowered {
+				t.Fatalf("planStartingOperatingPoint lowered fps=%v resolution=%v; want %v, %v",
+					fpsLowered, resolutionLowered, test.wantFPSLowered, test.wantResolutionLowered)
+			}
+			if request.OutputFPS != test.wantOutputFPS {
+				t.Fatalf("planned OutputFPS = %v, want %v", request.OutputFPS, test.wantOutputFPS)
+			}
+			if request.ScaleWidth != test.wantWidth || request.ScaleHeight != test.wantHeight {
+				t.Fatalf("planned scale = %d×%d, want %d×%d", request.ScaleWidth, request.ScaleHeight, test.wantWidth, test.wantHeight)
+			}
+		})
+	}
+}
+
+func TestPlanStartingOperatingPointTakesSmallestRungForImpossibleDensity(t *testing.T) {
+	request := EncodeRequest{VideoCodec: "h264", Encoder: "libx264", AutoResolution: true}
+	info := VideoInfo{Width: 1920, Height: 1080, FPS: 60}
+	fpsLowered, resolutionLowered := planStartingOperatingPoint(&request, info, minimumVideoBitrateKbps)
+	if fpsLowered || !resolutionLowered {
+		t.Fatalf("expected only a resolution change, got fps=%v resolution=%v", fpsLowered, resolutionLowered)
+	}
+	if request.ScaleWidth != 320 || request.ScaleHeight != 180 {
+		t.Fatalf("an impossible density must still land on the smallest software rung, got %d×%d", request.ScaleWidth, request.ScaleHeight)
+	}
+}
+
+func TestHardwareProbeRequiresDecodableOutput(t *testing.T) {
+	tempDir := t.TempDir()
+	script := func(name, verifyExit string) string {
+		path := filepath.Join(tempDir, name)
+		content := `#!/bin/sh
+for argument do
+  case "$argument" in
+    -err_detect) exit ` + verifyExit + ` ;;
+  esac
+done
+for output do :; done
+printf 'x' > "$output"
+`
+		if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if !runHardwareProbeAtSize(script("clean-ffmpeg", "0"), "h264_vaapi", "", 1280, 720) {
+		t.Fatal("an encoder whose output decodes cleanly must pass the probe")
+	}
+	if runHardwareProbeAtSize(script("broken-ffmpeg", "1"), "vp9_mediacodec", "", 1280, 720) {
+		t.Fatal("an encoder whose output fails to decode must be rejected")
 	}
 }
 
