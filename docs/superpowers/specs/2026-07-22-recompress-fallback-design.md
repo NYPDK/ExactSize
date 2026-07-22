@@ -17,8 +17,13 @@ stream sizes instead of estimates.
 
 ## Decision summary
 
-- Trigger: automatic, only when generation 1 (the existing ladder) exhausts its
-  attempts with a completed over-target output. No new UI, setting, or API field.
+- Trigger: automatic, when generation 1 (the existing ladder) gives up while a
+  completed over-target output exists. Give-up means attempt exhaustion (where the
+  final-attempt monitor disable guarantees the artifact) or the two GPU
+  cannot-reach-target returns (where the artifact exists whenever the just-measured
+  attempt ran to completion rather than being early-stopped). Infeasible-target
+  errors ("target too small…") never chain — recompression cannot fix them. No new
+  UI, setting, or API field.
 - Depth: exactly one recompression generation. If generation 2 also fails, the job
   fails with the current error text plus a note that recompression was attempted.
 - Scope: compress jobs only (`TargetBytes > 0`). The remux path is untouched.
