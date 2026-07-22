@@ -39,6 +39,10 @@ DAV1D_VERSION=1.5.3
 DAV1D_ARCHIVE="dav1d-$DAV1D_VERSION.tar.gz"
 DAV1D_URL="https://code.videolan.org/videolan/dav1d/-/archive/$DAV1D_VERSION/$DAV1D_ARCHIVE"
 DAV1D_SHA256=cbe212b02faf8c6eed5b6d55ef8a6e363aaab83f15112e960701a9c3df813686
+OPUS_VERSION=1.6.1
+OPUS_ARCHIVE="opus-$OPUS_VERSION.tar.gz"
+OPUS_URL="https://downloads.xiph.org/releases/opus/$OPUS_ARCHIVE"
+OPUS_SHA256=6ffcb593207be92584df15b32466ed64bbec99109f007c82205f0194572411a1
 MESON_VERSION=1.10.0
 MESON_ARCHIVE="meson-$MESON_VERSION.tar.gz"
 MESON_URL="https://github.com/mesonbuild/meson/releases/download/$MESON_VERSION/$MESON_ARCHIVE"
@@ -194,16 +198,19 @@ done
 FFMPEG_TARBALL="$CACHE_DIR/$FFMPEG_ARCHIVE"
 X264_TARBALL="$CACHE_DIR/$X264_ARCHIVE"
 DAV1D_TARBALL="$CACHE_DIR/$DAV1D_ARCHIVE"
+OPUS_TARBALL="$CACHE_DIR/$OPUS_ARCHIVE"
 MESON_TARBALL="$CACHE_DIR/$MESON_ARCHIVE"
 NINJA_ZIP="$CACHE_DIR/$NINJA_ARCHIVE"
 download "$FFMPEG_URL" "$FFMPEG_TARBALL"
 download "$X264_URL" "$X264_TARBALL"
 download "$DAV1D_URL" "$DAV1D_TARBALL"
+download "$OPUS_URL" "$OPUS_TARBALL"
 download "$MESON_URL" "$MESON_TARBALL"
 download "$NINJA_URL" "$NINJA_ZIP"
 verify_sha256 "$FFMPEG_SHA256" "$FFMPEG_TARBALL"
 verify_sha256 "$X264_SHA256" "$X264_TARBALL"
 verify_sha256 "$DAV1D_SHA256" "$DAV1D_TARBALL"
+verify_sha256 "$OPUS_SHA256" "$OPUS_TARBALL"
 verify_sha256 "$MESON_SHA256" "$MESON_TARBALL"
 verify_sha256 "$NINJA_SHA256" "$NINJA_ZIP"
 
@@ -230,23 +237,28 @@ NATIVE_PREFIX_REAL="$BUILD_ROOT/native-prefix"
 X264_SOURCE_REAL="$BUILD_ROOT/src/x264"
 DAV1D_SOURCE_REAL="$BUILD_ROOT/src/dav1d"
 DAV1D_BUILD_REAL="$BUILD_ROOT/src/dav1d-build"
+OPUS_SOURCE_REAL="$BUILD_ROOT/src/opus"
 FFMPEG_SOURCE_REAL="$BUILD_ROOT/src/ffmpeg"
 NATIVE_PREFIX="$SHORT_ROOT/native-prefix"
 X264_SOURCE="$SHORT_ROOT/src/x264"
 DAV1D_SOURCE="$SHORT_ROOT/src/dav1d"
 DAV1D_BUILD="$SHORT_ROOT/src/dav1d-build"
+OPUS_SOURCE="$SHORT_ROOT/src/opus"
 FFMPEG_SOURCE="$SHORT_ROOT/src/ffmpeg"
-NATIVE_MARKER="$FFMPEG_SOURCE_REAL/.exactsize-$FFMPEG_VERSION-$X264_COMMIT-dav1d-$DAV1D_VERSION-$NDK_VERSION-mediacodec-pages16"
+NATIVE_MARKER="$FFMPEG_SOURCE_REAL/.exactsize-$FFMPEG_VERSION-$X264_COMMIT-dav1d-$DAV1D_VERSION-opus-$OPUS_VERSION-$NDK_VERSION-mediacodec-pages16"
 mkdir -p "$BUILD_ROOT/src"
 if [ ! -f "$NATIVE_MARKER" ] || [ ! -f "$NATIVE_PREFIX_REAL/lib/libdav1d.a" ] || \
+    [ ! -f "$NATIVE_PREFIX_REAL/lib/libopus.a" ] || \
     [ ! -x "$FFMPEG_SOURCE_REAL/ffmpeg" ] || [ ! -x "$FFMPEG_SOURCE_REAL/ffprobe" ]; then
   clean_dir "$NATIVE_PREFIX_REAL"
   clean_dir "$X264_SOURCE_REAL"
   clean_dir "$DAV1D_SOURCE_REAL"
   clean_dir "$DAV1D_BUILD_REAL"
+  clean_dir "$OPUS_SOURCE_REAL"
   clean_dir "$FFMPEG_SOURCE_REAL"
   tar -xzf "$X264_TARBALL" -C "$X264_SOURCE_REAL" --strip-components=1
   tar -xzf "$DAV1D_TARBALL" -C "$DAV1D_SOURCE_REAL" --strip-components=1
+  tar -xzf "$OPUS_TARBALL" -C "$OPUS_SOURCE_REAL" --strip-components=1
   tar -xJf "$FFMPEG_TARBALL" -C "$FFMPEG_SOURCE_REAL" --strip-components=1
 
   printf 'Building x264 for arm64-v8a\n' >&2
@@ -298,6 +310,24 @@ if [ ! -f "$NATIVE_MARKER" ] || [ ! -f "$NATIVE_PREFIX_REAL/lib/libdav1d.a" ] ||
   ninja -C "$DAV1D_BUILD" -j "$BUILD_JOBS"
   ninja -C "$DAV1D_BUILD" install
 
+  # WebM only allows Opus or Vorbis audio, so without libopus the Android app
+  # cannot offer any audio codec for that container (FFmpeg's built-in Opus
+  # encoder is experimental and audibly worse). Desktop builds get libopus from
+  # BtbN's static FFmpeg; here it is cross-compiled like the video codecs.
+  printf 'Building libopus for arm64-v8a\n' >&2
+  (
+    cd "$OPUS_SOURCE"
+    CC="$CC" AR="$AR" RANLIB="$RANLIB" CFLAGS="-O2 -fPIC" ./configure \
+      --host=aarch64-linux-android \
+      --prefix="$NATIVE_PREFIX" \
+      --enable-static \
+      --disable-shared \
+      --disable-doc \
+      --disable-extra-programs
+    make -j"$BUILD_JOBS"
+    make install
+  )
+
   printf 'Building FFmpeg and ffprobe for arm64-v8a\n' >&2
   # FFmpeg's MediaCodec encoders use the NDK API when no JVM is attached
   # (the ExactSize backend is an isolated child process). This exposes the
@@ -307,6 +337,7 @@ if [ ! -f "$NATIVE_MARKER" ] || [ ! -f "$NATIVE_PREFIX_REAL/lib/libdav1d.a" ] ||
     cd "$FFMPEG_SOURCE"
     PKG_CONFIG_PATH="$NATIVE_PREFIX/lib/pkgconfig" ./configure \
       --prefix="$NATIVE_PREFIX" \
+      --pkg-config-flags="--static" \
       --target-os=android \
       --arch=aarch64 \
       --enable-cross-compile \
@@ -323,6 +354,7 @@ if [ ! -f "$NATIVE_MARKER" ] || [ ! -f "$NATIVE_PREFIX_REAL/lib/libdav1d.a" ] ||
       --enable-mediacodec \
       --enable-libx264 \
       --enable-libdav1d \
+      --enable-libopus \
       --enable-static \
       --disable-shared \
       --disable-doc \
@@ -339,6 +371,10 @@ if [ ! -f "$NATIVE_MARKER" ] || [ ! -f "$NATIVE_PREFIX_REAL/lib/libdav1d.a" ] ||
       --disable-securetransport \
       --disable-videotoolbox \
       --disable-audiotoolbox
+    # The APK cannot be smoke-run on the build host, so catch a silently
+    # dropped audio encoder here instead of on a user's phone.
+    grep -q '#define CONFIG_LIBOPUS_ENCODER 1' config_components.h || \
+      die "FFmpeg configure did not enable the libopus encoder"
     make -j"$BUILD_JOBS" ffmpeg ffprobe
   )
   touch "$NATIVE_MARKER"
