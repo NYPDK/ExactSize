@@ -474,7 +474,40 @@ func (j *Job) runEncode(ffmpeg, ffprobe string) error {
 	tempOutput := filepath.Join(tempDir, "output."+containerExtension(j.request.Container))
 	passLog := filepath.Join(tempDir, "pass")
 
-	_, err = j.runAttemptLadder(ffmpeg, ffprobe, encoder, info, tempOutput, passLog, ladderOptions{})
+	artifact, err := j.runAttemptLadder(ffmpeg, ffprobe, encoder, info, tempOutput, passLog, ladderOptions{chainCandidate: true})
+	if err != nil || artifact == nil {
+		return err
+	}
+
+	// Last resort: the ladder gave up from the source, but its completed
+	// over-target output is a simpler input the same settings can usually
+	// squeeze under the ceiling. One extra generation, then give up for real.
+	chainInput := filepath.Join(tempDir, "chain-input."+containerExtension(j.request.Container))
+	if err := os.Rename(tempOutput, chainInput); err != nil {
+		return fmt.Errorf("stash recompression input: %w", err)
+	}
+	chainInfo, err := probeVideo(j.ctx, ffprobe, chainInput)
+	if err != nil {
+		return err
+	}
+	startKbps, err := chainStartKbps(j.request.TargetBytes, chainInfo.Duration, artifact, encoder.Hardware)
+	if err != nil {
+		return err
+	}
+	j.request.Input = chainInput
+	if j.request.AudioCodec != "none" {
+		j.request.AudioCopy = true
+	}
+	opening := "The encoder could not reach the target from the source. Recompressing the compressed output — quality may be reduced."
+	j.set(func(status *JobSnapshot) {
+		status.Phase = "Correcting"
+		status.Message = opening
+	})
+	_, err = j.runAttemptLadder(ffmpeg, ffprobe, encoder, chainInfo, tempOutput, passLog, ladderOptions{
+		startVideoKbps: startKbps,
+		openingMessage: opening,
+		failureSuffix:  ", even after recompressing the output",
+	})
 	return err
 }
 
