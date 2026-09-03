@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -38,7 +39,7 @@ func TestDisabledFrameRateHandlesStayOpaque(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	styles := string(css)
+	styles := strings.ReplaceAll(string(css), "\r\n", "\n")
 	if !strings.Contains(styles, ".frame-rate-range:disabled {\n  opacity: 1;\n}") {
 		t.Fatal("disabled FPS handles must remain opaque while encoding locks the sliders")
 	}
@@ -251,6 +252,9 @@ func TestSearchDirTreeStopsAtTheDeadline(t *testing.T) {
 }
 
 func TestLocateRecentFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("recently-used.xbel is a Linux desktop history")
+	}
 	dataDir := t.TempDir()
 	fileDir := filepath.Join(t.TempDir(), "My Videos")
 	if err := os.MkdirAll(fileDir, 0o755); err != nil {
@@ -333,6 +337,9 @@ func TestMountedMediaDirs(t *testing.T) {
 // each root only once, and treat an XDG entry pointing at $HOME as disabled
 // (xdg-user-dirs' sentinel) so the noisy home walk always stays last.
 func TestDropSearchDirsDeduplicatesRoots(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("XDG user-dirs are Linux-only")
+	}
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	if err := os.MkdirAll(filepath.Join(home, ".config"), 0o755); err != nil {
@@ -360,6 +367,9 @@ func TestDropSearchDirsDeduplicatesRoots(t *testing.T) {
 // A drop resolved through the recent-documents list works even when the file
 // lives somewhere the directory search would never look.
 func TestLocateOriginalFileUsesRecentDocuments(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("recently-used.xbel is a Linux desktop history")
+	}
 	t.Setenv("HOME", t.TempDir())
 	dataDir := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", dataDir)
@@ -385,6 +395,9 @@ func TestLocateOriginalFileUsesRecentDocuments(t *testing.T) {
 // the drop event. The locator must reread it once before falling back to a
 // temporary upload, which would lose the source directory for output naming.
 func TestLocateOriginalFileRetriesDelayedRecentDocument(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("recently-used.xbel is a Linux desktop history")
+	}
 	sourceDir := filepath.Join(t.TempDir(), "outside-search-roots")
 	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
 		t.Fatal(err)

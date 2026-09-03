@@ -17,7 +17,7 @@ FFmpeg is bundled. On first run the AppImage adds itself to your app menu with i
 
 ### Windows
 
-Extract `ExactSize-1.12.4-windows-x86_64.zip` and run `ExactSize.exe`. Keep `ffmpeg.exe` and `ffprobe.exe` beside it; the folder is portable and needs no installer. ExactSize uses Edge, Chrome, Brave, or the registered browser for its local interface.
+Extract `ExactSize-1.12.4-windows-x86_64.zip` and run `ExactSize.exe`. Keep `ffmpeg.exe` and `ffprobe.exe` beside it; the folder is portable and needs no installer. The interface runs in ExactSize's own frameless window powered by the WebView2 runtime that ships with Windows; if that runtime is missing, it falls back to an Edge, Chrome, Brave, or registered-browser window.
 
 ### Android
 
@@ -80,7 +80,8 @@ The Linux build embeds GitHub zsync update metadata and produces:
 - `build/ExactSize-<version>-x86_64.AppImage`
 - `build/ExactSize-<version>-x86_64.AppImage.zsync`
 
-Windows portable ZIP (`unzip` and `zip` are also required):
+Windows portable ZIP (`unzip` and `zip` are also required; a Python 3 interpreter
+can substitute for `zip`):
 
 ```bash
 ./scripts/build-windows.sh

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -20,6 +22,7 @@ const (
 	processQueryLimitedInformation = 0x1000
 	stillActive                    = 259
 	createNoWindow                 = 0x08000000
+	belowNormalPriorityClass       = 0x00004000
 	mbOK                           = 0x00000000
 	mbIconWarning                  = 0x00000030
 	mbIconError                    = 0x00000010
@@ -29,6 +32,7 @@ const (
 var (
 	kernel32           = syscall.NewLazyDLL("kernel32.dll")
 	createMutexW       = kernel32.NewProc("CreateMutexW")
+	setPriorityClass   = kernel32.NewProc("SetPriorityClass")
 	openProcess        = kernel32.NewProc("OpenProcess")
 	getExitCodeProcess = kernel32.NewProc("GetExitCodeProcess")
 	user32             = syscall.NewLazyDLL("user32.dll")
@@ -87,7 +91,15 @@ func processIsRunning(pid int) bool {
 	return ok != 0 && exitCode == stillActive
 }
 
-func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
+func launchAppWindow(url string, onClosed func()) (*exec.Cmd, bool, func(), error) {
+	// The first-party WebView2 window is preferred: frameless, no browser
+	// process tree, and it wires window-close straight into shutdown. The
+	// Chromium app-mode path remains as the fallback for systems without
+	// the WebView2 runtime.
+	if launchWebViewWindow(url, onClosed) {
+		return nil, false, func() {}, nil
+	}
+
 	profileDir, cleanupProfile, err := createBrowserProfile()
 	if err != nil {
 		return nil, false, func() {}, fmt.Errorf("create temporary browser profile: %w", err)
@@ -140,7 +152,9 @@ func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
 		cmd := exec.Command(path, chromeArgs...)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+		// The browser is a GUI-subsystem executable: no console exists to
+		// hide, and HideWindow/CREATE_NO_WINDOW set STARTUPINFO's SW_HIDE,
+		// which Chromium honors: the app window would never appear.
 		if err := cmd.Start(); err == nil {
 			return cmd, true, cleanupProfile, nil
 		}
@@ -182,6 +196,25 @@ func expectedReleaseAssetName(releaseVersion string) string {
 
 func configureBackgroundCommand(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+}
+
+// demoteProcessPriority moves a long-running encode to BELOW_NORMAL after
+// start (the stdlib SysProcAttr cannot set a priority class pre-start).
+// Encodes then yield the CPU to the foreground window and shell whenever
+// they actually compete for a core; on an otherwise idle machine the
+// scheduler gives the encode everything anyway, so throughput is unchanged.
+func demoteProcessPriority(command *exec.Cmd) {
+	if command.Process == nil {
+		return
+	}
+	handle, err := windows.OpenProcess(
+		windows.PROCESS_SET_INFORMATION|windows.PROCESS_QUERY_LIMITED_INFORMATION,
+		false, uint32(command.Process.Pid))
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(handle)
+	setPriorityClass.Call(uintptr(handle), belowNormalPriorityClass)
 }
 
 func showWindowsMessageBox(message string, fatal bool) {

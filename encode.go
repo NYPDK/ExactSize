@@ -892,6 +892,8 @@ func (j *Job) runFFmpeg(ffmpeg string, args []string, duration, fps float64, pas
 	if err := command.Start(); err != nil {
 		return fmt.Errorf("start FFmpeg: %w", err)
 	}
+	// Long encodes are background work; never let them wrestle the UI for CPU.
+	demoteProcessPriority(command)
 
 	monitor := newOutputSizeMonitor(duration, targetBytes, timeBoundedProjection)
 	if monitor != nil {

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -58,15 +59,16 @@ func TestCheckLatestRelease(t *testing.T) {
 		if got := r.Header.Get("User-Agent"); got != "ExactSize/1.9.1" {
 			t.Errorf("User-Agent = %q", got)
 		}
+		asset := expectedReleaseAssetName("1.10.0")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"tag_name": "v1.10.0",
 			"html_url": "https://github.com/NYPDK/ExactSize/releases/tag/v1.10.0",
 			"assets": []map[string]any{{
-				"name":                 "ExactSize-1.10.0-x86_64.AppImage",
+				"name":                 asset,
 				"state":                "uploaded",
 				"size":                 123456,
 				"digest":               "sha256:" + strings.Repeat("a", 64),
-				"browser_download_url": "https://github.com/NYPDK/ExactSize/releases/download/v1.10.0/ExactSize-1.10.0-x86_64.AppImage",
+				"browser_download_url": "https://github.com/NYPDK/ExactSize/releases/download/v1.10.0/" + asset,
 			}},
 		})
 	}))
@@ -88,13 +90,14 @@ func TestCheckLatestRelease(t *testing.T) {
 }
 
 func TestUpdateRoutesCheckAndOpenExactReleaseAsset(t *testing.T) {
-	assetURL := "https://github.com/NYPDK/ExactSize/releases/download/v9.0.0/ExactSize-9.0.0-x86_64.AppImage"
+	asset := expectedReleaseAssetName("9.0.0")
+	assetURL := "https://github.com/NYPDK/ExactSize/releases/download/v9.0.0/" + asset
 	releaseServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"tag_name": "v9.0.0",
 			"html_url": "https://github.com/NYPDK/ExactSize/releases/tag/v9.0.0",
 			"assets": []map[string]any{{
-				"name":                 "ExactSize-9.0.0-x86_64.AppImage",
+				"name":                 asset,
 				"state":                "uploaded",
 				"size":                 123456,
 				"digest":               "sha256:" + strings.Repeat("b", 64),
@@ -137,8 +140,8 @@ func TestUpdateRoutesCheckAndOpenExactReleaseAsset(t *testing.T) {
 func TestValidateUpdateAssetRejectsUntrustedOrIncompleteMetadata(t *testing.T) {
 	valid := UpdateInfo{
 		LatestVersion: "2.0.0",
-		AssetName:     "ExactSize-2.0.0-x86_64.AppImage",
-		AssetURL:      "https://github.com/NYPDK/ExactSize/releases/download/v2.0.0/ExactSize-2.0.0-x86_64.AppImage",
+		AssetName:     expectedReleaseAssetName("2.0.0"),
+		AssetURL:      "https://github.com/NYPDK/ExactSize/releases/download/v2.0.0/" + expectedReleaseAssetName("2.0.0"),
 		AssetSize:     100,
 		AssetDigest:   "sha256:" + strings.Repeat("c", 64),
 		tagName:       "v2.0.0",
@@ -148,7 +151,7 @@ func TestValidateUpdateAssetRejectsUntrustedOrIncompleteMetadata(t *testing.T) {
 	}
 	for name, mutate := range map[string]func(*UpdateInfo){
 		"wrong host":     func(info *UpdateInfo) { info.AssetURL = "https://example.com/" + info.AssetName },
-		"wrong asset":    func(info *UpdateInfo) { info.AssetName = "other.AppImage" },
+		"wrong asset":    func(info *UpdateInfo) { info.AssetName = "other.bin" },
 		"missing digest": func(info *UpdateInfo) { info.AssetDigest = "" },
 		"invalid size":   func(info *UpdateInfo) { info.AssetSize = 0 },
 	} {
@@ -170,6 +173,9 @@ func fakeAppImage(payload string) []byte {
 }
 
 func TestDownloadAndReplaceAppImageAtomicallyAfterVerification(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("AppImage replace uses Unix rename-over-file")
+	}
 	oldImage := fakeAppImage("working old version")
 	newImage := fakeAppImage(strings.Repeat("verified new version", 32))
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -201,7 +207,7 @@ func TestDownloadAndReplaceAppImageAtomicallyAfterVerification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o751 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o751 {
 		t.Fatalf("installed mode = %v, want 0751", info.Mode().Perm())
 	}
 	assertNoUpdateTemporaryFiles(t, filepath.Dir(current))
@@ -242,6 +248,9 @@ func TestDownloadVerificationFailuresLeaveCurrentAppImageUntouched(t *testing.T)
 }
 
 func TestRunningAppImagePathResolvesOnlyARealAppImageBuild(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("AppImage self-update is Linux-only")
+	}
 	directory := t.TempDir()
 	image := filepath.Join(directory, "ExactSize-2.0.0-x86_64.AppImage")
 	if err := os.WriteFile(image, fakeAppImage("running"), 0o755); err != nil {

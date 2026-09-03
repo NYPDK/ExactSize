@@ -101,6 +101,16 @@ func dropSearchDirs() []string {
 			dirs = append(dirs, dir)
 		}
 	}
+	if runtime.GOOS == "windows" {
+		for _, name := range []string{"Videos", "Downloads", "Desktop", "Documents", "Pictures", "Music"} {
+			dir := filepath.Join(home, name)
+			if info, err := os.Stat(dir); err == nil && info.IsDir() {
+				appendDir(dir)
+			}
+		}
+		appendDir(home)
+		return dirs
+	}
 	for _, key := range []string{"VIDEOS", "DOWNLOAD", "DESKTOP", "DOCUMENTS", "PICTURES", "MUSIC"} {
 		// xdg-user-dirs records a disabled folder as $HOME itself; the home
 		// directory joins the list separately, at the end.
@@ -322,7 +332,7 @@ func skipDropSearchDir(name string) bool {
 // traversal segments must never influence where the search looks.
 func sanitizeDropName(name string) string {
 	base := filepath.Base(strings.TrimSpace(name))
-	if base == "." || base == "/" {
+	if base == "." || base == "/" || base == `\` {
 		return ""
 	}
 	return base
@@ -445,7 +455,7 @@ func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	status.Version = version
 	status.NativeDialog = hasNativeDialog()
-	status.Frameless = hasKWinScripting()
+	status.Frameless = windowControlsSupported()
 	status.DefaultOutputDir = filepath.ToSlash(defaultOutputDir())
 	writeJSON(w, http.StatusOK, status)
 }
@@ -724,29 +734,20 @@ var resizeUpdate = fmt.Sprintf(
 )
 
 func (a *App) handleWindowAction(w http.ResponseWriter, r *http.Request) {
-	if !hasKWinScripting() {
+	if !windowControlsSupported() {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": false})
 		return
 	}
 	var err error
 	switch r.PathValue("action") {
 	case "move-start":
-		// A real compositor move via X11; the cursor-following KWin script
-		// remains as the fallback for non-X11 windows.
-		if err = startX11MoveResize(netWMMoveResizeMove); err != nil {
-			err = startKWinFollowScript(followScript(moveUpdate))
-		}
+		err = startWindowDrag()
 	case "resize-start":
-		if err = startX11MoveResize(netWMMoveResizeSizeBottomRight); err != nil {
-			err = startKWinFollowScript(followScript(resizeUpdate))
-		}
+		err = startWindowResize()
 	case "move-end", "resize-end":
-		// The compositor ends an X11 interactive move itself; this only tears
-		// down a fallback follower if one is active.
-		err = unloadKWinScript(followPlugin)
+		err = endWindowFollow()
 	case "minimize":
-		err = runKWinScript(`var target = workspace.activeWindow || workspace.activeClient;
-if (target && target.caption === "ExactSize") { target.minimized = true; }`)
+		err = minimizeWindow()
 	default:
 		writeError(w, http.StatusBadRequest, "unknown window action")
 		return
