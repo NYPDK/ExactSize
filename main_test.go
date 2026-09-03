@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,7 +12,10 @@ import (
 )
 
 func TestInstanceGuardRejectsDuplicateAndReleasesOnClose(t *testing.T) {
-	guardName := "\x00exactsize-test-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	guardName := "exactsize-test-" + strconv.Itoa(os.Getpid()) + "-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	if runtime.GOOS != "windows" {
+		guardName = "\x00" + guardName
+	}
 	first, err := acquireInstanceGuard(guardName)
 	if err != nil {
 		t.Fatalf("acquire first instance guard: %v", err)
@@ -36,6 +40,9 @@ func TestInstanceGuardRejectsDuplicateAndReleasesOnClose(t *testing.T) {
 }
 
 func TestAlreadyRunningDialogUsesNativeWarning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses MessageBoxW instead of kdialog")
+	}
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "dialog-args")
 	kdialog := filepath.Join(dir, "kdialog")
@@ -66,6 +73,9 @@ func TestMinimumWindowHeightFitsIndependentResolutionToggle(t *testing.T) {
 }
 
 func TestAppImageIntegrationRetargetsLaunchersToCurrentVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("AppImage launcher integration is Linux-only")
+	}
 	home := t.TempDir()
 	desktopDir := filepath.Join(home, "Desktop")
 	if err := os.MkdirAll(desktopDir, 0o755); err != nil {
@@ -138,6 +148,8 @@ func TestAppImageIntegrationRetargetsLaunchersToCurrentVersion(t *testing.T) {
 func TestBrowserProfileCleanup(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
+	t.Setenv("TMP", tempDir)
+	t.Setenv("TEMP", tempDir)
 
 	profileDir, cleanup, err := createBrowserProfile()
 	if err != nil {
@@ -161,6 +173,8 @@ func TestBrowserProfileCleanup(t *testing.T) {
 func TestStaleBrowserProfileCleanupPreservesActiveProfiles(t *testing.T) {
 	tempDir := t.TempDir()
 	t.Setenv("TMPDIR", tempDir)
+	t.Setenv("TMP", tempDir)
+	t.Setenv("TEMP", tempDir)
 
 	makeProfile := func(name, owner string) string {
 		t.Helper()

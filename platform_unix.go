@@ -46,7 +46,8 @@ func processIsRunning(pid int) bool {
 	return err == nil || errors.Is(err, os.ErrPermission)
 }
 
-func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
+func launchAppWindow(url string, onClosed func()) (*exec.Cmd, bool, func(), error) {
+	_ = onClosed // the Unix shell tracks the browser process instead
 	type candidate struct {
 		command string
 		args    []string
@@ -126,6 +127,37 @@ func launchAppWindow(url string) (*exec.Cmd, bool, func(), error) {
 	return nil, false, func() {}, errors.New("no supported browser was found (Brave, Chrome, Chromium, Firefox, or xdg-open)")
 }
 
+// windowControlsSupported mirrors the Windows check: the custom header's
+// window actions work wherever a compositor-side handler exists (KDE today).
+func windowControlsSupported() bool { return hasKWinScripting() }
+
+// startWindowDrag starts a genuine compositor move via X11; the
+// cursor-following KWin script remains as the fallback for non-X11 windows.
+func startWindowDrag() error {
+	if err := startX11MoveResize(netWMMoveResizeMove); err != nil {
+		return startKWinFollowScript(followScript(moveUpdate))
+	}
+	return nil
+}
+
+func startWindowResize() error {
+	if err := startX11MoveResize(netWMMoveResizeSizeBottomRight); err != nil {
+		return startKWinFollowScript(followScript(resizeUpdate))
+	}
+	return nil
+}
+
+// endWindowFollow tears down a fallback follower if one is active; the
+// compositor ends an X11 interactive move itself.
+func endWindowFollow() error {
+	return unloadKWinScript(followPlugin)
+}
+
+func minimizeWindow() error {
+	return runKWinScript(`var target = workspace.activeWindow || workspace.activeClient;
+if (target && target.caption === "ExactSize") { target.minimized = true; }`)
+}
+
 func appImageOwnedByCurrentUser(info fs.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return !ok || stat.Uid == uint32(os.Geteuid())
@@ -136,5 +168,7 @@ func expectedReleaseAssetName(releaseVersion string) string {
 }
 
 func configureBackgroundCommand(*exec.Cmd) {}
+
+func demoteProcessPriority(*exec.Cmd) {}
 
 func showWindowsMessageBox(string, bool) {}

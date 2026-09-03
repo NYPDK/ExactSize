@@ -28,8 +28,14 @@ download() {
 
 command -v "$GO_BIN" >/dev/null 2>&1 || die "$GO_BIN was not found on PATH"
 command -v unzip >/dev/null 2>&1 || die "unzip is required"
-command -v zip >/dev/null 2>&1 || die "zip is required"
 command -v strings >/dev/null 2>&1 || die "strings is required to inspect ffmpeg.exe"
+if command -v zip >/dev/null 2>&1; then
+  ZIP_BIN=zip
+elif command -v python >/dev/null 2>&1 || command -v python3 >/dev/null 2>&1; then
+  ZIP_BIN=
+else
+  die "zip or python is required to create the portable archive"
+fi
 
 VERSION="$(sed -n 's/^const version = "\(.*\)"$/\1/p' "$PROJECT_ROOT/main.go")"
 [ -n "$VERSION" ] || die "could not read the version from main.go"
@@ -82,7 +88,22 @@ unzip -p "$FFMPEG_ZIP" '*/LICENSE.txt' >"$OUTPUT_DIR/FFMPEG-LICENSE.txt"
 [ -s "$OUTPUT_DIR/FFMPEG-LICENSE.txt" ] || die "FFmpeg license was not extracted"
 
 rm -f "$OUTPUT_ARCHIVE"
-(cd "$(dirname -- "$OUTPUT_DIR")" && zip -X -q -r "$OUTPUT_ARCHIVE" "$(basename -- "$OUTPUT_DIR")")
+if [ -n "${ZIP_BIN:-}" ]; then
+  (cd "$(dirname -- "$OUTPUT_DIR")" && zip -X -q -r "$OUTPUT_ARCHIVE" "$(basename -- "$OUTPUT_DIR")")
+else
+  PYTHON_BIN="$(command -v python3 || command -v python)"
+  "$PYTHON_BIN" - "$OUTPUT_DIR" "$OUTPUT_ARCHIVE" <<'PY'
+import os, sys, zipfile
+source, archive = sys.argv[1], sys.argv[2]
+root_name = os.path.basename(source)
+with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+    for dirpath, _, filenames in os.walk(source):
+        for filename in filenames:
+            path = os.path.join(dirpath, filename)
+            arcname = os.path.join(root_name, os.path.relpath(path, source)).replace("\\", "/")
+            bundle.write(path, arcname)
+PY
+fi
 [ -s "$OUTPUT_ARCHIVE" ] || die "portable archive was not created"
 
 printf '%s\n%s\n' "$OUTPUT_DIR/ExactSize.exe" "$OUTPUT_ARCHIVE"

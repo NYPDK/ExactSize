@@ -110,9 +110,13 @@ func run() error {
 	url := fmt.Sprintf("http://%s/?token=%s", listener.Addr().String(), token)
 	if os.Getenv("EXACTSIZE_HEADLESS") == "1" {
 		fmt.Println(url)
-	} else {
+	} else if urlFile := strings.TrimSpace(os.Getenv("EXACTSIZE_URL_FILE")); urlFile != "" {
+		// Automation hook: lets tests drive the real GUI instance's API.
+		_ = os.WriteFile(urlFile, []byte(url), 0o600)
+	}
+	if os.Getenv("EXACTSIZE_HEADLESS") != "1" {
 		hideTitleBarOnKDE()
-		browser, waitForWindow, cleanupBrowser, err := launchAppWindow(url)
+		browser, waitForWindow, cleanupBrowser, err := launchAppWindow(url, stop)
 		if err != nil {
 			_ = listener.Close()
 			return fmt.Errorf("open application window: %w", err)

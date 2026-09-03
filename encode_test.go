@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -724,6 +725,9 @@ func TestEarlyCorrectionContextExplainsProjection(t *testing.T) {
 }
 
 func TestEarlySizeCorrectionCancelsCleansAndRetries(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg helper is a Unix shell script")
+	}
 	tempDir := t.TempDir()
 	input := filepath.Join(tempDir, "input.mp4")
 	output := filepath.Join(tempDir, "output.mp4")
@@ -797,6 +801,9 @@ printf 'out_time_us=10000000\nprogress=end\n'
 }
 
 func TestRunFFmpegPreservesUsefulCorrectionMessage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake ffmpeg helper is a Unix shell script")
+	}
 	tempDir := t.TempDir()
 	ffmpeg := filepath.Join(tempDir, "fake-ffmpeg")
 	if err := os.WriteFile(ffmpeg, []byte("#!/bin/sh\nprintf 'out_time_us=1000000\\nprogress=end\\n'\n"), 0o755); err != nil {
