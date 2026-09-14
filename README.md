@@ -9,8 +9,8 @@ A local Linux, Windows, and Android video compressor with one promise: the outpu
 ### Linux
 
 ```bash
-chmod +x ExactSize-1.14.0-x86_64.AppImage
-./ExactSize-1.14.0-x86_64.AppImage
+chmod +x ExactSize-1.14.1-x86_64.AppImage
+./ExactSize-1.14.1-x86_64.AppImage
 ```
 
 FFmpeg is bundled. On first run the AppImage adds itself to your app menu with its icon.
