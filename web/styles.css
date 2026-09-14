@@ -31,6 +31,7 @@
   --secondary-text: #e5e4de;
   --secondary-hover-border: #6b6e64;
   --toast-bg: #2b2c28;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23aaa9a2' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
   --radius-sm: 5px;
   --radius: 6px;
   --radius-lg: 6px;
@@ -72,6 +73,7 @@
   --secondary-text: #2e362b;
   --secondary-hover-border: #727c6e;
   --toast-bg: #fff;
+  --select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23596356' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
 }
 
 * {
@@ -555,7 +557,7 @@ input:hover {
    treatment stuck on the closed dropdown. */
 @media (hover: hover) and (pointer: fine) {
   select:hover:not(:focus) {
-    background: var(--control-hover);
+    background-color: var(--control-hover);
     border-color: var(--border-strong);
   }
 }
@@ -566,13 +568,13 @@ select:focus-visible {
 }
 
 select:focus:not(:focus-visible) {
-  background: var(--input);
+  background-color: var(--input);
   border-color: var(--border);
 }
 
 html[data-input-modality="pointer"] select:focus,
 html[data-input-modality="pointer"] select:focus-visible {
-  background: var(--input);
+  background-color: var(--input);
   border-color: var(--border);
   outline: none;
 }
@@ -581,8 +583,15 @@ input {
   padding: 0 10px;
 }
 
+/* Native select arrows sit outside padding, so the 80px unit control
+   clipped labels like "MB". Hide them and draw a chevron in that padding. */
 select {
+  appearance: none;
   padding: 0 30px 0 10px;
+  background-image: var(--select-chevron);
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 12px 12px;
 }
 
 .target-value-field input {
@@ -591,8 +600,13 @@ select {
   font-variant-numeric: tabular-nums;
 }
 
+.unit-field {
+  flex: 0 0 auto;
+}
+
 .unit-field select {
   width: 80px;
+  min-width: 80px;
 }
 
 .strict-note {
@@ -1398,7 +1412,8 @@ html[data-platform="android"] .target-value-field input {
 }
 
 html[data-platform="android"] .unit-field select {
-  width: 72px;
+  width: 80px;
+  min-width: 80px;
 }
 
 html[data-platform="android"] .strict-note {
