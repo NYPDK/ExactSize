@@ -122,7 +122,7 @@ func revealFile(path string) error {
 		return errors.New("Windows Explorer is not available")
 	}
 	cmd := exec.Command(explorer, "/select,"+path)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	configureForegroundCommand(cmd)
 	return cmd.Start()
 }
 
@@ -132,6 +132,6 @@ func openExternalURL(rawURL string) error {
 		return errors.New("the Windows URL launcher is not available")
 	}
 	cmd := exec.Command(launcher, "url.dll,FileProtocolHandler", rawURL)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+	configureForegroundCommand(cmd)
 	return cmd.Start()
 }

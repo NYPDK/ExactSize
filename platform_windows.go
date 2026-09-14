@@ -152,9 +152,7 @@ func launchAppWindow(url string, onClosed func()) (*exec.Cmd, bool, func(), erro
 		cmd := exec.Command(path, chromeArgs...)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
-		// The browser is a GUI-subsystem executable: no console exists to
-		// hide, and HideWindow/CREATE_NO_WINDOW set STARTUPINFO's SW_HIDE,
-		// which Chromium honors: the app window would never appear.
+		configureForegroundCommand(cmd)
 		if err := cmd.Start(); err == nil {
 			return cmd, true, cleanupProfile, nil
 		}
@@ -167,7 +165,7 @@ func launchAppWindow(url string, onClosed func()) (*exec.Cmd, bool, func(), erro
 		cmd := exec.Command(launcher, "url.dll,FileProtocolHandler", url)
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+		configureForegroundCommand(cmd)
 		if err := cmd.Start(); err == nil {
 			cleanupProfile()
 			return cmd, false, func() {}, nil
@@ -194,8 +192,22 @@ func expectedReleaseAssetName(releaseVersion string) string {
 	return "ExactSize-" + releaseVersion + "-windows-x86_64.zip"
 }
 
+// configureBackgroundCommand suppresses the console window of a helper that
+// only ever produces output we read ourselves: ffmpeg, ffprobe, and the
+// PowerShell host. It must never be used for a process whose job is to put a
+// window on screen; see configureForegroundCommand.
 func configureBackgroundCommand(command *exec.Cmd) {
 	command.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
+}
+
+// configureForegroundCommand starts a process that must show its own window.
+// It deliberately leaves SysProcAttr nil. HideWindow sets STARTF_USESHOWWINDOW
+// with wShowWindow=SW_HIDE, and Windows documents that for GUI processes the
+// nCmdShow of the *first* ShowWindow call is ignored in favour of that value.
+// A Chromium browser started with it therefore creates its app window hidden
+// and can never reveal it, which leaves ExactSize running with no visible UI.
+func configureForegroundCommand(command *exec.Cmd) {
+	command.SysProcAttr = nil
 }
 
 // demoteProcessPriority moves a long-running encode to BELOW_NORMAL after
